@@ -4,6 +4,7 @@
  * Copyright (c) 2006 Per-Olof Astrom
  * Copyright (c) 2006-2008 Roger Abrahamsson
  * Copyright (c) 2008 Zdravko
+ * Copyright (c) 2024 Heiko Bobzin
  *
  * This file is originated from the nd100em project.
  *
@@ -28,7 +29,6 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <pthread.h>
-#include <semaphore.h>
 #include <signal.h>
 #include <unistd.h>
 #include <sys/time.h>
@@ -36,42 +36,157 @@
 #include <limits.h>
 #include <math.h>
 #include <string.h>
+#include "nd100lib.h"
 #include "nd100.h"
 #include "cpu.h"
+#include "cpu_state.h"
 
-
+extern void trace_open(void);
+extern void trace_shift_files(void);
+void checkPK_inInt(char *msg);
 #define BUFSTRSIZE 24
 
-struct termios savetty;
+#define IID_PG_FAULT (1<<3)
+#define IID_MEM_PROT (1<<2)
+
+struct termios nd_savetty;
 
 /* Interrupt thread synchronization */
-sem_t sem_int;
+nd_sem_t sem_int;
 
 /* mopc synchronization */
-sem_t sem_mopc;
+nd_sem_t sem_mopc;
 
 /* running cpu synchronization */
-sem_t sem_run;
+nd_sem_t sem_run;
 
 /* stopping cpu synchronization */
-sem_t sem_stop;
+nd_sem_t sem_stop;
 
 /* Performance stuff */
 
-double instr_counter;
+unsigned long int instr_counter;
 
-float usertime,systemtime,totaltime;
-struct rusage *used;
+_NDRAM_        VolatileMemory;
+_RUNMODE_    CurrentCPURunMode;
+_CPUTYPE_    CurrentCPUType;
+
+struct CpuRegs *gReg;
+union NewPT *gPT;
+struct MemTraceList *gMemTrace;
+struct IdentChain *gIdentChain;
+static volatile bool save_state_and_stop = false;
+
+/* We have a maximum of 64Kword device register addresses*/
+ unsigned short devices[65536];
+
+ unsigned short MON_RUN=1;
+
+ unsigned short MODE_RUN=1;
+ unsigned short MODE_OPCOM=0;
+
+/* This variable tells us if we have the display panel option */
+ unsigned short PANEL_PROCESSOR=0;
+
+char *regn[] = {"S","D","P","B","L","A","T","X","U0","U1"};
+char *regn_w[] = {"DS","DD","DP","DB","DL","DA","DT","DX"};
+
+char *intregn_r[] = {"PANS","STS","OPR","PGS","PVL","IIC","PID","PIE","CSR","ACTL", "ALD" ,"PES","PGC","PEA","16","17"};
+char *intregn_w[] = {"PANC","STS","LMP","PCR", "4", "IIE","PID","PIE","CCL","LCIL","UCILR","13", "14", "15" ,"16","17"};
+
+char *relmode_str[] ={"",",B ","I ","I ,B ",",X ",",X ,B ","I ,X ","I ,B ,X "};
+char *shtype_str[] ={"","ROT ","ZIN ","LIN "};
+
+char *skiptype_str[] = {"EQL","GEQ","GRE","MGRE","UEQ","LSS","LST","MLST"};
+char *skipregn_dst[] = {"0","DD","DP","DB","DL","DA","DT","DX"};
+char *skipregn_src[] = {"0","SD","SP","SB","SL","SA","ST","SX"};
+
+char *bopstsbit_str[] = {"SSPTM","SSTG","SSK","SSZ","SSQ","SSO","SSC","SSM","","","","","","","",""};
+
+char *bop_str[] = {"BSET ZRO","BSET ONE","BSET BCM","BSET BAC","BSKP ZRO","BSKP ONE",
+           "BSKP BCM","BSKP BAC","BSTC","BSTA","BLDC","BLDA","BANC","BAND","BORC","BORA"};
+
+ushort MemoryTraceRead(ushort addr, bool UseAPT);
+
+void (*instr_funcs[65536])(ushort);
+
 
 /* temporary string for misc data, basically a junk variable */
 /* used by different trace stuff before sending off to tracing */
 char trace_temp_str[256];
 
+struct {
+    ushort nPC[16];
+    ushort call[16];
+    ushort opcount[16];
+} monitordata;
+
+static const char *mon_text[256] = {
+    "RTEXT","VFGET","YFPUT","ECHOM","BRKM","RDISK","WDISK","XRPAGE",    // 000..007
+    "XWPAGE","TIME","SETOLD","CIBUF","COBUF","SETUP","MGTTY","MSTTY",   // 010..017
+    "WCI","MBINB","MBOUT","BBINB","BBOUT","SETW","LSTC","RDSC",         // 020..027
+    "GTRT","EXIOX","MSG","MALTN","MALTF","IOUT","NOWAIT","AIRDW",       // 030..037
+    "SPCLO","MROBJ","OLDOP","CLOFI","MRUSE","BDBRK","BGBRK","BSBRK",    // 040..047
+    "OPFIL","GBRKD","MTERM","MRSEG","MDLFI","RSPQE","MPASE","MPAGE",    // 050..057
+    "N5OOM","FIXCS","RMAX","B4INW","ERMSG","QERMS","ISIZE","OSIZE",     // 060..067
+    "COMSB","MCDES","MCEES","SMAX","SETBY","REABT","SBSIZ","SETBC",     // 070..077
+    "RT","SET","ABSET","INTV","HOLD","ABORT","CONCT","DSCNT",           // 100..107
+    "PRIOR","UPDAT","CLADJ","CLOCK","TUSED","MOFIX","MUNFIX","XRFILE",  // 110..117
+    "XWFILE","WAITF","RESRV","RELES","PRSRV","PRLS","DSET","DABST",     // 120..127
+    "DINTV","ABSTR","MCALL","MEXIT","RTEXT","RTWT","RTON","RTOFF",      // 130..137
+    "WHERE","IOSET","ERRMON","RSIO","MAGTP","ACM","IPRIV","CAMAC",      // 140..147
+    "GL","GRTDA","GRTNA","IOXN","ASSIG","PLOTT","TRACB","ENTSG",        // 150..157
+    "FIXC","3INSTR","3OUTST","WFRQI","WSEG","DIW","DOLW","REENT",       // 160..167
+    "US0","US1","US2","US3","US4","US5","US6","US7",                    // 170..177
+    "XMSGX","XTLX","JETMO","JETM2","BRPNT","DEBUG","EDTRM","RERRP",     // 200..207
+    "P0EARL","P1EARL","SREEN","MUIDI","GUSNA","DROBJ","DWOBJ","GUIOI",  // 210..217
+    "DOPEN","CRALF","GBGSZ","JETM3","JETM4","JETM5","JETM6","MSDAE",    // 220
+    "MGDAE","EXPFI","MRNFI","STEFI","SPEFI","SCROP","SPERM","SFACC",    // 230
+    "APSPF","SUSCN","RUSCN","FDINA","GDIEN","GNAEN","RESDI","RELDI",    // 240
+    "FDFDI","COPAG","BCLOS","CRALN","GERDV","PIOCM","DEABF","FOPFN",        // 250
+    "USCNT","SYCNT","CPUST"," GDEVTY","500RF"," SOOWF"," 500MTP","TMOUT",   // 260
+    "RDPAG","WDPAG","DELPG"," MGFIL"," FOBJN"," SETTF"," ELOFU"," DLOFU",   // 270
+    "EUSEL","DUSEL","ELON","ELOFF","MAPSIB","MSIBB","GTMOD","TNOWAI",       // 300
+    "TBINB","WDIEN","MOINF","IBRSIZ","SDRUS","MLAMU","SLRMO","UECOMSB",     // 310
+    "UELOGIN","UEADM","GSGNO","SPLRE","MOCTBU","MBECHO","MLOGIN","WRBIX",   // 320
+    "TRTER","MSVSU","TREPP","UDMA","GETXM","EXABS","???","???" };           // 330 ... (255 dez)
+
+static const char *mon_par[256] = {
+    "","","","","","","","",    // 000..007
+    "","","","","","","","",   // 010..017
+    "","","","","","","","",         // 020..027
+    "","","","","","","","",       // 030..037
+    "","","","","","","","",    // 040..047
+    "AoToX$","","","","","","","",    // 050..057
+    "","","","","","","","",     // 060..067
+    "","","","","","","","",     // 070..077
+    "","","","","","","","",           // 100..107
+    "II","","","","","","","",  // 110..117
+    "","","III","II","","","","",     // 120..127
+    "","IIII","Too","","","","","",      // 130..137
+    "","","","","","","","",      // 140..147
+    "","","","","","","","",        // 150..157
+    "","","","","","","","",       // 160..167
+    "","","","","","","","",                    // 170..177
+    "","","","","","","","",     // 200..207
+    "","","","","","","","",  // 210..217
+    "","","","","","","","",    // 220
+    "","","","","","","","",    // 230
+    "","","","","","","","",    // 240
+    "","","","","","","","",        // 250
+    "","","","","","","","",   // 260
+    "","","","","","","","",   // 270
+    "","","","","","","","",       // 300
+    "","","","","","","","",     // 310
+    "","","","","","","","",   // 320
+    "","","","","","","???","???" };           // 330 ... (255 dez)
+
+
 /* OpToStr
  * IN: pointer to string ,raw operand
  * OUT: Sets the string with the dissassembled operand and values
  */
-void OpToStr(char *opstr, ushort operand) {
+void OpToStr(char *opstr, ushort pc, ushort operand, ushort *absaddr, char *accessType) {
 	ushort instr;
 	char numstr[BUFSTRSIZE];
 	char deltastr[BUFSTRSIZE];
@@ -85,106 +200,148 @@ void OpToStr(char *opstr, ushort operand) {
 	relmode = (operand & 0x0700)>> 8;
 	delta = (operand & 070);
 
+    instr=extract_opcode(operand);
 	/* put offset into a string variable in octal with +/- sign for easy reading */
-	((int)offset <0) ? (void)snprintf(numstr,BUFSTRSIZE,"-%o",-(int)offset) : (void)snprintf(numstr,BUFSTRSIZE,"%o",offset);
-
+    if (relmode == 0 || (instr >= 0130000 && instr <= 0137777)) {
+        ushort reladdr = pc + offset;
+        if (absaddr != NULL) {
+            *absaddr = reladdr;
+        }
+        ((int)offset <0) ? (void)snprintf(numstr,BUFSTRSIZE,"-%o (@%o)",-(int)offset,reladdr) : (void)snprintf(numstr,BUFSTRSIZE,"%o (@%o)",offset,reladdr);
+    } else {
+        ((int)offset <0) ? (void)snprintf(numstr,BUFSTRSIZE,"-%o",-(int)offset) : (void)snprintf(numstr,BUFSTRSIZE,"%o",offset);
+        if (absaddr != NULL) {
+            *absaddr = 0;
+        }
+    }
 	/* ND110 delta offset for some instructions */
 	(void)snprintf(deltastr,sizeof(deltastr),"%o",delta);
 
-	instr=extract_opcode(operand);
+    char accMode = '?';
 	switch(instr) {
 	case 0000000: /* STZ */
 		(void)snprintf(opstr,BUFSTRSIZE,"STZ %s%s",relmode_str[relmode],numstr);
+        accMode = 'S';
 		break;
 	case 0004000: /* STA */
 		(void)snprintf(opstr,BUFSTRSIZE,"STA %s%s",relmode_str[relmode],numstr);
+            accMode = 'S';
 		break;
 	case 0010000: /* STT */
 		(void)snprintf(opstr,BUFSTRSIZE,"STT %s%s",relmode_str[relmode],numstr);
+            accMode = 'S';
 		break;
 	case 0014000: /* STX */
 		(void)snprintf(opstr,BUFSTRSIZE,"STX %s%s",relmode_str[relmode],numstr);
+            accMode = 'S';
 		break;
 	case 0020000: /* STD */
 		(void)snprintf(opstr,BUFSTRSIZE,"STD %s%s",relmode_str[relmode],numstr);
+            accMode = 'S';
 		break;
 	case 0024000: /* LDD */
 		(void)snprintf(opstr,BUFSTRSIZE,"LDD %s%s",relmode_str[relmode],numstr);
+            accMode = 'L';
 		break;
 	case 0030000: /* STF */
 		(void)snprintf(opstr,BUFSTRSIZE,"STF %s%s",relmode_str[relmode],numstr);
+            accMode = 'S';
 		break;
 	case 0034000: /* LDF */
 		(void)snprintf(opstr,BUFSTRSIZE,"LDF %s%s",relmode_str[relmode],numstr);
+            accMode = 'L';
 		break;
 	case 0040000: /* MIN */
 		(void)snprintf(opstr,BUFSTRSIZE,"MIN %s%s",relmode_str[relmode],numstr);
+            accMode = 'S';
 		break;
 	case 0044000: /* LDA */
 		(void)snprintf(opstr,BUFSTRSIZE,"LDA %s%s",relmode_str[relmode],numstr);
+            accMode = 'L';
 		break;
 	case 0050000: /* LDT */
 		(void)snprintf(opstr,BUFSTRSIZE,"LDT %s%s",relmode_str[relmode],numstr);
+            accMode = 'L';
 		break;
 	case 0054000: /* LDX */
 		(void)snprintf(opstr,BUFSTRSIZE,"LDX %s%s",relmode_str[relmode],numstr);
+            accMode = 'L';
 		break;
 	case 0060000: /* ADD */
 		(void)snprintf(opstr,BUFSTRSIZE,"ADD %s%s",relmode_str[relmode],numstr);
+            accMode = 'L';
 		break;
 	case 0064000: /* SUB */
 		(void)snprintf(opstr,BUFSTRSIZE,"SUB %s%s",relmode_str[relmode],numstr);
+            accMode = 'L';
 		break;
 	case 0070000: /* AND */
 		(void)snprintf(opstr,BUFSTRSIZE,"AND %s%s",relmode_str[relmode],numstr);
+            accMode = 'L';
 		break;
 	case 0074000: /* ORA */
 		(void)snprintf(opstr,BUFSTRSIZE,"ORA %s%s",relmode_str[relmode],numstr);
+            accMode = 'L';
 		break;
 	case 0100000: /* FAD */
 		(void)snprintf(opstr,BUFSTRSIZE,"FAD %s%s",relmode_str[relmode],numstr);
+            accMode = 'L';
 		break;
 	case 0104000: /* FSB */
 		(void)snprintf(opstr,BUFSTRSIZE,"FSB %s%s",relmode_str[relmode],numstr);
+            accMode = 'L';
 		break;
 	case 0110000: /* FMU */
 		(void)snprintf(opstr,BUFSTRSIZE,"FMU %s%s",relmode_str[relmode],numstr);
+            accMode = 'L';
 		break;
 	case 0114000: /* FDV */
 		(void)snprintf(opstr,BUFSTRSIZE,"FDV %s%s",relmode_str[relmode],numstr);
+            accMode = 'L';
 		break;
 	case 0120000: /* MPY */
 		(void)snprintf(opstr,BUFSTRSIZE,"MPY %s%s",relmode_str[relmode],numstr);
+            accMode = 'L';
 		break;
 	case 0124000: /* JMP */
 		(void)snprintf(opstr,BUFSTRSIZE,"JMP %s%s",relmode_str[relmode],numstr);
+            accMode = 'J';
 		break;
 	case 0130000: /* JAP */
 		(void)snprintf(opstr,BUFSTRSIZE,"JAP %s",numstr);
+            accMode = 'J';
 		break;
 	case 0130400: /* JAN */
 		(void)snprintf(opstr,BUFSTRSIZE,"JAN %s",numstr);
+            accMode = 'J';
 		break;
 	case 0131000: /* JAZ */
 		(void)snprintf(opstr,BUFSTRSIZE,"JAZ %s",numstr);
+            accMode = 'J';
 		break;
 	case 0131400: /* JAF */
 		(void)snprintf(opstr,BUFSTRSIZE,"JAF %s",numstr);
+            accMode = 'J';
 		break;
 	case 0132000: /* JPC */
 		(void)snprintf(opstr,BUFSTRSIZE,"JPC %s",numstr);
+            accMode = 'J';
 		break;
 	case 0132400: /* JNC */
 		(void)snprintf(opstr,BUFSTRSIZE,"JNC %s",numstr);
+            accMode = 'J';
 		break;
 	case 0133000: /* JXZ */
 		(void)snprintf(opstr,BUFSTRSIZE,"JXZ %s",numstr);
+            accMode = 'J';
 		break;
 	case 0133400: /* JXN */
 		(void)snprintf(opstr,BUFSTRSIZE,"JXN %s",numstr);
+            accMode = 'J';
 		break;
 	case 0134000: /* JPL */
 		(void)snprintf(opstr,BUFSTRSIZE,"JPL %s%s",relmode_str[relmode],numstr);
+            accMode = 'U';
 		break;
 	case 0140000: /* SKP */
 		(void)snprintf(opstr,BUFSTRSIZE,"SKP IF %s %s %s",skipregn_dst[(operand & 0x0007)],skiptype_str[((operand & 0x0700) >> 8)],skipregn_src[((operand & 0x0038) >> 3)]);
@@ -566,7 +723,7 @@ void OpToStr(char *opstr, ushort operand) {
 		(void)snprintf(opstr,BUFSTRSIZE,"LRB %o",(operand & 0x0078) >> 3);
 		break;
 	case 0153000: /* MON */
-		(void)snprintf(opstr,BUFSTRSIZE,"MON %o",(operand & 0x00ff));
+		(void)snprintf(opstr,BUFSTRSIZE,"MON %o %s",(operand & 0x00ff),mon_text[operand & 0x00ff]);
 		break;
 	case 0153400: /* IRW */
 		(void)snprintf(opstr,BUFSTRSIZE,"IRW %o %s",(operand & 0x0078), regn_w[(operand & 0x0007)]);
@@ -655,15 +812,21 @@ void OpToStr(char *opstr, ushort operand) {
 	case 0177200: /* BAND */
 	case 0177400: /* BORC */
 	case 0177600: /* BORA */
-		if (!(operand & 0x0007)) /* STS reg bits handling FIXME:: what if it is bit >7 & STS??*/
-			(void)snprintf(opstr,BUFSTRSIZE,"%s %s",bop_str[((operand & 0x0780) >> 7)],bopstsbit_str[((operand & 0x0078) >> 3)]);
-		else
-			(void)snprintf(opstr,BUFSTRSIZE,"%s %o D%s",bop_str[((operand & 0x0780) >> 7)],(int)(operand & 0x0078), regn[(operand & 0x0007)]);
+            if (!(operand & 0x0007)) {/* STS reg bits handling FIXME:: what if it is bit >7 & STS??*/
+                ushort statusBit = (operand & 0x0078) >> 3;
+                (void)snprintf(opstr,BUFSTRSIZE,"%s %s",bop_str[((operand & 0x0780) >> 7)],bopstsbit_str[statusBit]);
+            } else {
+                ushort statusBit = (operand & 0x0078) >> 3;
+                (void)snprintf(opstr,BUFSTRSIZE,"%s bit%d D%s",bop_str[((operand & 0x0780) >> 7)], statusBit, regn[(operand & 0x0007)]);
+            }
 		break;
 	default: /* UNDEF */ /* Some ND instruction codes is undefined unfortunately. */
 		(void)snprintf(opstr,BUFSTRSIZE,"UNDEF");
 		break;
 	}
+    if (accessType != NULL) {
+        *accessType = accMode;
+    }
 }
 
 /* STZ
@@ -980,7 +1143,7 @@ void ndfunc_fad(ushort operand){
 	gA = r[1];
 	gD = r[2];
 	if (res == -1)
-		setbit(_STS,_TG,1);
+		nd_setbit(_STS,_TG,1);
 	if (trace) trace_post(3,"T",(int)gT,"A",(int)gA,"D",(int)gD);
 	gPC++;
 }
@@ -1079,15 +1242,23 @@ void ndfunc_geco(ushort operand){
 	gPC++;
 }
 
+void do_stop(char *message)
+{
+    if (trace) {
+        fprintf(tracefile,"STOP: %s\n",message);
+        fflush(tracefile);
+    }
+    CurrentCPURunMode = STOP;
+    gPC++;
+}
+
 /* VERSN - ND110+
  * IN: uses A reg bit 11-8 as a bitfield to addess the byte of the version number read, the total is 16 bytes
  * so instruction has to be called 16 times, with incremented A each time.
  * OUT: Sets A, T, D
  */
 void ndfunc_versn(ushort operand){
-	/* STUB FUNCTION - TODO */
-	CurrentCPURunMode = STOP; /* OK unimplemented function, lets stop CPU and end program that way */
-	gPC++;
+    do_stop("Unimplemented VERSN");
 }
 
 /* IOT
@@ -1134,9 +1305,7 @@ void ndfunc_ioxt(ushort operand){
 /* SETPT
  */
 void ndfunc_setpt(ushort operand){
-	/* STUB FUNCTION - TODO */
-	CurrentCPURunMode = STOP; /* OK unimplemented function, lets stop CPU and end program that way */
-	gPC++;
+    do_stop("Unimplemented SETPT");
 }
 
 /* CLEPT
@@ -1199,25 +1368,27 @@ void ndfunc_ion(ushort operand){
 /* IRW
  */
 void ndfunc_irw(ushort operand){
-	ushort dr, temp;
+	ushort dr, level;
 
-	temp = ((operand & 0x0078) >> 3);
+	level = ((operand & 0x0078) >> 3);
 	dr = (operand & 0x0007);
-	if (( temp == gPIL ) && (dr == 2)) /* P on current level, this becomes NOOP */
+	if (( level == gPIL ) && (dr == 2)) /* P on current level, this becomes NOOP */
 		;
 	else
 		if (!dr)
-			gReg->reg[temp][dr] = (gReg->reg[temp][dr] & 0xFF00) | (gA & 0x00FF); /* Only touch lower 8 bits on STS */
+			gReg->reg[level][dr] = (gReg->reg[level][dr] & 0xFF00) | (gA & 0x00FF); /* Only touch lower 8 bits on STS */
 		else
-			gReg->reg[temp][dr] = gA;
+			gReg->reg[level][dr] = gA;
 	gPC++;
 }
 
 /* IRR
  */
 void ndfunc_irr(ushort operand){
-	gA = gReg->reg[((operand & 0x0078) >> 3)][(operand & 0x0007)];
-	if ((operand & 0x0007) == 0)	/* clear top 8 bits as STS reg read */
+    ushort level = (operand & 0x0078) >> 3;
+    ushort registerNo = operand & 0x0007;
+	gA = gReg->reg[level][registerNo];
+	if (registerNo == 0)	/* clear top 8 bits as STS reg read */
 		gA &= 0x00FF;
 	gPC++;
 }
@@ -1239,6 +1410,9 @@ void ndfunc_depo(ushort operand){
 	unsigned int fulladdress;
 
 	fulladdress = (((unsigned int)gA) <<16) | (ushort)gD;
+    if (trace && fulladdress == 0376000) {
+        fprintf(tracefile,"DEPO addr 0%o val=0%o",fulladdress,gT);
+    }
 	PhysMemWrite(gT,fulladdress);
 	/* TODO:: privilege check */
 	gPC++;
@@ -1247,8 +1421,9 @@ void ndfunc_depo(ushort operand){
 /* POF
  */
 void ndfunc_pof(ushort operand){
+    gPC++;
 	setbit_STS_MSB(_PONI,0);
-	gPC++;
+    prefetch();
 }
 
 /* PIOF
@@ -1263,8 +1438,9 @@ void ndfunc_piof(ushort operand){
 /* PON
  */
 void ndfunc_pon(ushort operand){
+    gPC++;
 	setbit_STS_MSB(_PONI,1);
-	gPC++;
+    prefetch();
 }
 
 /* PION
@@ -1332,14 +1508,58 @@ void ndfunc_aax(ushort operand){
 /* MON
  */
 void ndfunc_mon(ushort operand){
-	char offset;
-	offset = (char)(operand & 0x00ff);
+	ushort offset;
+	offset = (operand & 0x00ff);
 
 	gPC++;
+    monitordata.nPC[CurrLEVEL] = gPC;
+    monitordata.call[CurrLEVEL] = offset;
+    monitordata.opcount[CurrLEVEL] = 0;
 	if(emulatemon)
 		mon(offset);
 	else {			/* :TODO: Check this as it is still untested */
-		gReg->reg[14][_T]= (operand & 0x00ff);
+		gReg->reg[14][_T] = offset;
+        if (trace) {
+            char tracebuf[1024];
+            char *tp = &tracebuf[0];
+            *tp = '\0';
+            char *ts = &tracebuf[0];
+            const char *pars = mon_par[offset];
+            ushort mem = gA;
+            while (*pars) {
+                switch (*pars) {
+                    case 'T': mem = gT;
+                        break;
+                    case 'X': mem = gX;
+                        break;
+                    case 'o':
+                        snprintf(tp,1024-(tp-ts)," 0%o",MemoryTraceRead(mem++,false));
+                        while (*tp) tp++;
+                        break;
+                    case '$': // String like in MON 50
+                        for (int i = 0; i < 32; i++) {
+                            ushort ch = MemoryTraceRead(mem++,false);
+                            snprintf(tp,1024-(tp-ts),"%c%c",(ch >> 8),(ch & 0xff));
+                            while (*tp) tp++;
+                        }
+                        break;
+                    case 'O':
+                        snprintf(tp,1024-(tp-ts)," 0%o",MemoryTraceRead(mem++,false));
+                        while (*tp) tp++;
+                        break;
+                    case 'd':
+                        snprintf(tp,1024-(tp-ts)," %d",MemoryTraceRead(mem++,false));
+                        while (*tp) tp++;
+                        break;
+                    case 'I':
+                        snprintf(tp,1024-(tp-ts)," 0%o",MemoryTraceRead(MemoryTraceRead(mem++,false),false));
+                        while (*tp) tp++;
+                        break;
+                }
+                pars++;
+            }
+            fprintf(tracefile, "MON 0%o gA=0%o T=0%o%s\n",offset,gA,gT,tracebuf);
+        }
 		interrupt(14,1<<1); /* Monitor Call */
 	}
 }
@@ -1525,7 +1745,7 @@ void ndfunc_jnc(ushort operand){
 	gX++;
 	if(((1<<15) & gX)) {
 		temp = (ushort)(sshort)(char)(operand&0x00ff);
-		gPC=do_add(gPC,temp,0); /* :TODO: need a non flagsetting add here instead */
+        gPC += temp;// do_add(gPC,temp,0); /* :TODO: need a non flagsetting add here instead */
 		if (DISASM)
 			disasm_userel(old_gPC,gPC);
 	} else
@@ -1646,9 +1866,9 @@ void ndfunc_init(ushort operand){
 		fprintf(debugfile,"INIT(ante): PC+7(return):%06o\n",MemoryRead(gPC+7,0));
 	}
 */
-	if (trace) trace_pre(2,"(gPC+1)",(int)MemoryRead(gPC+1,0),"(gPC+2)",(int)MemoryRead(gPC+2,0));
-	if (trace) trace_pre(2,"(gPC+3)",(int)MemoryRead(gPC+3,0),"(gPC+4)",(int)MemoryRead(gPC+4,0));
-	if (trace) trace_pre(2,"(gPC+6)",(int)MemoryRead(gPC+3,0),"(gPC+7)",(int)MemoryRead(gPC+4,0));
+	if (trace) trace_pre(2,"(gPC+1)",(int)MemoryTraceRead(gPC+1,0),"(gPC+2)",(int)MemoryTraceRead(gPC+2,0));
+	if (trace) trace_pre(2,"(gPC+3)",(int)MemoryTraceRead(gPC+3,0),"(gPC+4)",(int)MemoryTraceRead(gPC+4,0));
+	if (trace) trace_pre(2,"(gPC+6)",(int)MemoryTraceRead(gPC+3,0),"(gPC+7)",(int)MemoryTraceRead(gPC+4,0));
 	demand = MemoryRead(gPC+1,0);
 	start  = MemoryRead (gPC+2,0);
 	maxsize = MemoryRead(gPC+3,0);
@@ -1700,8 +1920,8 @@ void ndfunc_init(ushort operand){
  */
 void ndfunc_entr(ushort operand){
 	ushort oldB,demand,smax,stp;
-	if (trace) trace_pre(2,"(gPC+1)",(int)MemoryRead(gPC+1,0),"(gPC+2)",(int)MemoryRead(gPC+2,0));
-	if (trace) trace_pre(1,"(gPC+3)",(int)MemoryRead(gPC+3,0));
+	if (trace) trace_pre(2,"(gPC+1)",(int)MemoryTraceRead(gPC+1,0),"(gPC+2)",(int)MemoryTraceRead(gPC+2,0));
+	if (trace) trace_pre(1,"(gPC+3)",(int)MemoryTraceRead(gPC+3,0));
 	demand = MemoryRead(gPC+1,0);
 	smax = MemoryRead(gB-125,0); /* SMAX */
 	if ((gB+demand-122)>(smax)) { /* stack overflow */
@@ -1815,11 +2035,16 @@ void illegal_instr(ushort operand){
 }
 
 void unimplemented_instr(ushort operand){
-	CurrentCPURunMode = STOP; /* OK unimplemented function, lets stop CPU and end program that way */
-	gPC++;
+    do_stop("Unimplemented");
 }
 
-void prefetch(){
+void unimplemented_noop(ushort operand){
+    if (trace & 1) fprintf(tracefile, "Unimplemented, but noop\n");
+    gPC++;
+}
+
+
+void prefetch(void){
 	ushort temp;
 	temp = MemoryFetch(gPC,false);
 	gReg->myreg_PFB = temp;
@@ -1894,7 +2119,7 @@ void regop(ushort operand) { /* SWAP RAND REXO RORA RADD RCLR EXIT RDCR RING RSU
 				}
 				gReg->reg[CurrLEVEL][dr]= (ushort)( tmp &0xFFFF);
 			} else {
-				setbit(_STS,_C,0);
+				nd_setbit(_STS,_C,0);
 			}
 			break;
 	}
@@ -1913,7 +2138,7 @@ void regop(ushort operand) { /* SWAP RAND REXO RORA RADD RCLR EXIT RDCR RING RSU
 ushort GetEffectiveAddr(ushort instr) {
 	char disp = instr & 0xFF;
 	ushort eff_addr;
-	ushort res;
+	ushort res = 0;
 	switch((instr>>8) & 0x07) {
 	case 0:	/* (P) + disp */
 		res = gPC + disp;
@@ -1955,7 +2180,7 @@ ushort GetEffectiveAddr(ushort instr) {
  */
 ushort New_GetEffectiveAddr(ushort instr, bool *use_apt) {
 	char disp = instr & 0xFF;
-	ushort eff_addr;
+	ushort eff_addr = 0;
 	switch((instr>>8) & 0x07) {
 	case 0:	/* (P) + disp */
 		eff_addr = gPC + disp;
@@ -2016,29 +2241,30 @@ void DoMCL(ushort instr) {
 		break;
 	case 06:
 		/* This affects interrupt, so do locking and checking. */
+        while ((s = nd_sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
+            continue; /* Restart if interrupted by handler */
 		if (trace) trace_pre(2,"PID",gPID,"A",gA);
 
 		gPID &= ~gA;
-		if (sem_post(&sem_int) == -1) { /* release interrupt lock */
+        checkPK_inInt("MCL");
+		if (nd_sem_post(&sem_int) == -1) { /* release interrupt lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DOMCL\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
-
-		checkPK();
 		if (trace) trace_step(1,"PID {AND}{NOT} A",0);
 		if (trace) trace_post(1,"PID",gPID);
 		break;
 	case 07:
 		/* This affects interrupt, so do locking and checking. */
 		if (trace) trace_pre(2,"PIE",gPIE,"A",gA);
-		while ((s = sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
+		while ((s = nd_sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
 			continue; /* Restart if interrupted by handler */
 		gPIE &= ~gA;
-		if (sem_post(&sem_int) == -1) { /* release interrupt lock */
+        checkPK_inInt("MCL2");
+		if (nd_sem_post(&sem_int) == -1) { /* release interrupt lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DOMCL\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
-		checkPK();
 		if (trace) trace_step(1,"PIE {AND}{NOT} A",0);
 		if (trace) trace_post(1,"PIE",gPIE);
 		break;
@@ -2069,28 +2295,28 @@ void DoMST(ushort instr) {
 	case 06:
 		/* This affects interrupt, so do locking and checking. */
 		if (trace) trace_pre(2,"PID",gPID,"A",gA);
-		while ((s = sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
+		while ((s = nd_sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
 			continue; /* Restart if interrupted by handler */
 		gPID |= gA;
-		if (sem_post(&sem_int) == -1) { /* release interrupt lock */
+        checkPK_inInt("MST");
+		if (nd_sem_post(&sem_int) == -1) { /* release interrupt lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DOMCL\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
-		checkPK();
 		if (trace) trace_step(1,"PID {AND}{NOT} A",0);
 		if (trace) trace_post(1,"PID",gPID);
 		break;
 	case 07:
 		/* This affects interrupt, so do locking and checking. */
 		if (trace) trace_pre(2,"PIE",gPIE,"A",gA);
-		while ((s = sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
+		while ((s = nd_sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
 			continue; /* Restart if interrupted by handler */
 		gPIE |= gA;
-		if (sem_post(&sem_int) == -1) { /* release interrupt lock */
+        checkPK_inInt("MST2");
+		if (nd_sem_post(&sem_int) == -1) { /* release interrupt lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DOMCL\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
-		checkPK();
 		if (trace) trace_step(1,"PIE {AND}{NOT} A",0);
 		if (trace) trace_post(1,"PIE",gPIE);
 		break;
@@ -2117,7 +2343,7 @@ void DoMST(ushort instr) {
  * LOOP:	JMP *-7		(goto CLEPT)
  * END:		...
  */
-void DoCLEPT() {
+void DoCLEPT(void) {
 	ulong fulladdress;
 	ushort eff_addr;
 	ushort temp;
@@ -2162,7 +2388,7 @@ void DoTRA(ushort instr) {
 		if (debug) fprintf(debugfile,"TRA PANS: A <= %06o\n",gA);
 		break;
 	case 01: /* TRA STS */
-		gA= gReg->reg[gPIL][_STS]; /* If everything is done correctly elsewhere this should work fine */
+		gA = gReg->reg[gPIL][_STS]; /* If everything is done correctly elsewhere this should work fine */
 		if (trace) trace_step(1,"A<=STS",0);
 		break;
 	case 02: /* TRA OPR */
@@ -2172,11 +2398,11 @@ void DoTRA(ushort instr) {
 		break;
 	case 03: /* TRA PGS */
 		/* TODO:: Check that this also is supposed to clear the PGS as it "unlocks" it */
-		while ((s = sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
+		while ((s = nd_sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
 			continue; /* Restart if interrupted by handler */
 		gA = gPGS;
 		gPGS=0;
-		if (sem_post(&sem_int) == -1) { /* release interrupt lock */
+		if (nd_sem_post(&sem_int) == -1) { /* release interrupt lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DOMCL\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
@@ -2184,14 +2410,13 @@ void DoTRA(ushort instr) {
 		break;
 	case 04: /* TRA PVL */
 		/* This one has a strange format. Described in ND-100 Functional Description section 2.9.2.5.4 */
-		gA = 0; /* Clean it */
-		gA = (gPVL & 0x07)<<3 | 0xd782; /* = IRR (PVL) DP */
-		if (trace) trace_step(1,"A<=PVL",0);
+		gA = ((gPVL & 0x0F)<<3) | 0xd782; /* = IRR (PVL) DP */
+        if (trace) fprintf(tracefile,"TRA PVL A=0%o\n",gA);
 		break;
 	case 05: /* TRA IIC */
 		/* Manuals says(2.2.4.3) that this should be a number equal to the highest bit set in (IID & IIE) - Roger */
 		/* Only bit 1-10 is used, so we only return a value between 1 and 10  or else  zero */
-		while ((s = sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
+		while ((s = nd_sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
 			continue; /* Restart if interrupted by handler */
 		gIIC = 0;
 		temp=gIID & gIIE;
@@ -2199,9 +2424,12 @@ void DoTRA(ushort instr) {
 			gIIC = ((1<<i) & temp) ? i : gIIC;
 		}
 		gA = gIIC;
+        if (gA && trace) {
+            fprintf(tracefile, "IRQ pending in TRA IIC A=0%o\n",gA);
+        }
 		gIID = 0;
 		gReg->mylock_IIC = false;
-		if (sem_post(&sem_int) == -1) { /* release interrupt lock */
+		if (nd_sem_post(&sem_int) == -1) { /* release interrupt lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DOMCL\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
@@ -2236,6 +2464,9 @@ void DoTRA(ushort instr) {
 		break;
 	case 015:
 		gA = gPEA;
+            if (gPC >= 013747 && gPC <= 013777) {
+                temp = 0;
+            }
 		break;
 	default: /* These registers dont exist, so just return 0 for now FIXME: Check correct behaviour.*/
 		gA = 0;
@@ -2256,7 +2487,7 @@ void DoEXR(ushort instr) {
 	else
 		exr_instr = 0;
 	if (trace & 0x01) {
-		OpToStr(disasm_str,exr_instr);
+		OpToStr(disasm_str,gPC,exr_instr, NULL, NULL);
 		fprintf(tracefile,
 			"#o (i,d) #v# (\"%d\",\"EXR instr: %s\");\n",
 			(int)instr_counter,disasm_str);
@@ -2267,7 +2498,7 @@ void DoEXR(ushort instr) {
 	if (trace & 0x20) {
 	}
 	if (0140600 == extract_opcode(exr_instr)) { /* ILLEGAL:: EXR of EXR */
-		setbit(_STS,_Z,1);		//:TODO: activate CPU trap on level 14!!!
+        nd_setbit(_STS,_Z,1);		//:TODO: activate CPU trap on level 14!!!
 		return;
 	}
 	if (DISASM)
@@ -2285,26 +2516,27 @@ void DoWAIT(ushort instr) {
 	int s;
 	ushort temp;
 	if(!STS_IONI) { /* Interrupt is off, HALT cpu */
-		gPC++;
-		CurrentCPURunMode = STOP;
-		return;
+        do_stop("IRQ is disabled");
+        CurrentCPURunMode = SHUTDOWN;
+        return;
 	}
 	if(CurrLEVEL ==0 ) { /* This essentially becomes NOOP */
 		gPC++;
 	} else {
 		gPC++;
 		temp= ~(1<<CurrLEVEL); /* Now we have a 0 in the position we want */
-		while ((s = sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
+		while ((s = nd_sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
 			continue; /* Restart if interrupted by handler */
 		gPID &= temp; /* Give up this level */
-		if (sem_post(&sem_int) == -1) { /* release interrupt lock */
+        checkPK_inInt("WAIT");
+		if (nd_sem_post(&sem_int) == -1) { /* release interrupt lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DOMCL\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
-		checkPK();
 	}
 }
 
+extern void disasm_dump(void);
 /*
  * DoTRR - Transfer to register
  *  Affected: Internal register specified
@@ -2315,6 +2547,7 @@ void DoWAIT(ushort instr) {
 void DoTRR(ushort instr) {
 	int s;
 	ushort temp,level;
+
 	if (trace) trace_pre(1,"A",(int)gA);
 	switch(instr & 0x0F) {
 	case 00:
@@ -2322,7 +2555,7 @@ void DoTRR(ushort instr) {
 		if (trace) trace_step(1,"PANC<=A",0);
 		if (PANEL_PROCESSOR) {
 			gPAP->trr_panc = true;
-			if (sem_post(&sem_pap) == -1) { /* kick panel processor */
+			if (nd_sem_post(&sem_pap) == -1) { /* kick panel processor */
 				if (debug) fprintf(debugfile,"ERROR!!! sem_post failure TRR PANC\n");
 				CurrentCPURunMode = SHUTDOWN;
 			}
@@ -2341,42 +2574,43 @@ void DoTRR(ushort instr) {
 	case 03:
 		temp = gA;
 		level = (temp >> 3) & 0x0f;
-		gReg->reg_PCR[level]= temp & 0x0783; /* Mask out so we only get PT, APT, RING as per Manual*/
-		if (trace) trace_step(1,"PCR(%d)<=A",level);
+		gReg->reg_PCR[level]= temp & 0x0783; /* Mask out so we only set PT, APT, RING as per Manual*/
+        if (trace) fprintf(tracefile,"TRR PCR=0%o level=%d ring=%d\n",gReg->reg_PCR[level],level,temp & 3);
 		break;
 	case 05:
-		while ((s = sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
+		while ((s = nd_sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
 			continue; /* Restart if interrupted by handler */
 		gIIE = gA;
-		if (sem_post(&sem_int) == -1) { /* release interrupt lock */
+        if (trace) fprintf(tracefile,"IIE=0x%04x\n",gIIE);
+		if (nd_sem_post(&sem_int) == -1) { /* release interrupt lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DOMCL\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
-		checkPK();
+		checkPK("IIE set");
 		if (trace) trace_step(1,"IIE<=A",0);
 		break;
 	case 06:
 		/* This affects interrupt, so do locking and checking. */
-		while ((s = sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
+		while ((s = nd_sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
 			continue; /* Restart if interrupted by handler */
 		gPID = gA;
-		if (sem_post(&sem_int) == -1) { /* release interrupt lock */
+		if (nd_sem_post(&sem_int) == -1) { /* release interrupt lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DOMCL\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
-		checkPK();
+		checkPK("TRR6");
 		if (trace) trace_step(1,"PID<=A",0);
 		break;
 	case 07:
 		/* This affects interrupt, so do locking and checking. */
-		while ((s = sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
+		while ((s = nd_sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
 			continue; /* Restart if interrupted by handler */
 		gPIE = gA;
-		if (sem_post(&sem_int) == -1) { /* release interrupt lock */
+		if (nd_sem_post(&sem_int) == -1) { /* release interrupt lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DOMCL\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
-		checkPK();
+		checkPK("TRR7");
 		if (trace) trace_step(1,"PIE<=A",0);
 		break;
 	case 010:
@@ -2406,14 +2640,11 @@ void DoTRR(ushort instr) {
  */
 void DoSRB(ushort operand) {
 	ushort lvl, addr;
-	ushort temp;
 
 	lvl = ((operand & 0x0078) >> 3);
 	addr=gX;
 
 	if (trace) trace_pre(1,"X",(int)gX);
-
-	temp = gReg->reg[lvl][_STS] & 0x00ff;
 
 	MemoryWrite(gReg->reg[lvl][_P],addr,false,2);
 	if (trace) {
@@ -2445,7 +2676,7 @@ void DoSRB(ushort operand) {
 		(void)snprintf(trace_temp_str,255,"(%06o)<=L[%01o]:(%06o)",addr+5,lvl,gReg->reg[lvl][_L]);
 		trace_step(1,(char *)trace_temp_str,0);
 	}
-	MemoryWrite(temp,addr+6,false,2); /* Only write LSB of STS */
+	MemoryWrite(gReg->reg[lvl][_STS] & 0x00ff,addr+6,false,2);
 	if (trace) {
 		(void)snprintf(trace_temp_str,255,"(%06o)<=STS[%01o]:(%06o)",addr+6,lvl,gReg->reg[lvl][_STS]);
 		trace_step(1,(char *)trace_temp_str,0);
@@ -2463,54 +2694,61 @@ void DoSRB(ushort operand) {
  *  Affected:  P    X  T   A   D   L  STS  B
  */
 void DoLRB(ushort operand) {
-	ushort lvl, addr;
+    ushort lvl = (operand & 0x0078) >> 3;
+    ushort addr = gX;
 
-	lvl = ((operand & 0x0078) >> 3);
-	addr=gX;
-
+    ushort xP = MemoryRead(addr,false);
+    ushort xX = MemoryRead(addr+1,false);
+    ushort xT = MemoryRead(addr+2,false);
+    ushort xA = MemoryRead(addr+3,false);
+    ushort xD = MemoryRead(addr+4,false);
+    ushort xL = MemoryRead(addr+5,false);
+    ushort xS = MemoryRead(addr+6,false);
+    ushort xB = MemoryRead(addr+7,false);
+    
 	if (trace) trace_pre(1,"X",(int)gX);
-
+    
 	if (lvl != CurrLEVEL) {	/* Dont change P on current level if this happens to be specified */
-		gReg->reg[lvl][_P]   = MemoryRead(addr,false);
+        gReg->reg[lvl][_P]   = xP;
 		if (trace) {
-			(void)snprintf(trace_temp_str,255,"P[%01o]<=(%06o):%06o",lvl,addr,MemoryRead(addr,false));
+			(void)snprintf(trace_temp_str,255,"P[%01o]<=(%06o):%06o",lvl,addr,xP);
 			trace_step(1,(char *)trace_temp_str,0);
 		}
 	}
-	gReg->reg[lvl][_X]   = MemoryRead(addr+1,false);
+    gReg->reg[lvl][_X]   = xX;
 	if (trace) {
-		(void)snprintf(trace_temp_str,255,"X[%01o]<=(%06o):%06o",lvl,addr+1,MemoryRead(addr+1,false));
+		(void)snprintf(trace_temp_str,255,"X[%01o]<=(%06o):%06o",lvl,addr+1,xX);
 		trace_step(1,(char *)trace_temp_str,0);
 	}
-	gReg->reg[lvl][_T]   = MemoryRead(addr+2,false);
+	gReg->reg[lvl][_T]   = xT;
 	if (trace) {
-		(void)snprintf(trace_temp_str,255,"T[%01o]<=(%06o):%06o",lvl,addr+2,MemoryRead(addr+2,false));
+		(void)snprintf(trace_temp_str,255,"T[%01o]<=(%06o):%06o",lvl,addr+2,xT);
 		trace_step(1,(char *)trace_temp_str,0);
 	}
-	gReg->reg[lvl][_A]   = MemoryRead(addr+3,false);
+    gReg->reg[lvl][_A]   = xA;
 	if (trace) {
-		(void)snprintf(trace_temp_str,255,"A[%01o]<=(%06o):%06o",lvl,addr+3,MemoryRead(addr+3,false));
+		(void)snprintf(trace_temp_str,255,"A[%01o]<=(%06o):%06o",lvl,addr+3,xA);
 		trace_step(1,(char *)trace_temp_str,0);
 	}
-	gReg->reg[lvl][_D]   = MemoryRead(addr+4,false);
+    gReg->reg[lvl][_D]   = xD;
 	if (trace) {
-		(void)snprintf(trace_temp_str,255,"D[%01o]<=(%06o):%06o",lvl,addr+4,MemoryRead(addr+3,false));
+		(void)snprintf(trace_temp_str,255,"D[%01o]<=(%06o):%06o",lvl,addr+4,xD);
 		trace_step(1,(char *)trace_temp_str,0);
 	}
-	gReg->reg[lvl][_L]   = MemoryRead(addr+5,false);
+    gReg->reg[lvl][_L]   = xL;
 	if (trace) {
-		(void)snprintf(trace_temp_str,255,"L[%01o]<=(%06o):%06o",lvl,addr+5,MemoryRead(addr+3,false));
+		(void)snprintf(trace_temp_str,255,"L[%01o]<=(%06o):%06o",lvl,addr+5,xL);
 		trace_step(1,(char *)trace_temp_str,0);
 	}
-	gReg->reg[lvl][_STS] = 
-		(gReg->reg[lvl][_STS] & 0xff00 ) | (MemoryRead(addr+6,false) & 0x00ff); /* Only load LSB STS */
+    gReg->reg[lvl][_STS] =
+		(gReg->reg[lvl][_STS] & 0xff00 ) | (xS & 0x00ff); /* Only load LSB STS */
 	if (trace) {
-		(void)snprintf(trace_temp_str,255,"STS[%01o]<=(%06o):%06o",lvl,addr+6,MemoryRead(addr+3,false));
+		(void)snprintf(trace_temp_str,255,"STS[%01o]<=(%06o):%06o",lvl,addr+6,xS);
 		trace_step(1,(char *)trace_temp_str,0);
 	}
-	gReg->reg[lvl][_B]   = MemoryRead(addr+7,false);
+    gReg->reg[lvl][_B]   = xB;
 	if (trace) {
-		(void)snprintf(trace_temp_str,255,"B[%01o]<=(%06o):%06o",lvl,addr+7,MemoryRead(addr+3,false));
+		(void)snprintf(trace_temp_str,255,"B[%01o]<=(%06o):%06o",lvl,addr+7,xB);
 		trace_step(1,(char *)trace_temp_str,0);
 	}
 }
@@ -2582,18 +2820,18 @@ void do_bops(ushort operand) {
 	if (trace) trace_pre(1,regn[dr],gReg->reg[CurrLEVEL][dr]);
 	switch (( operand & 0x0780) >> 7) {
 	case 0 : /* BSET ZRO */
-		setbit(dr,bn,0);
+            nd_setbit(dr,bn,0);
 		break;
 	case 1 : /* BSET ONE */
-		setbit(dr,bn,1);
+            nd_setbit(dr,bn,1);
 		break;
 	case 2 : /* BSET BCM */
 		desti=getbit(dr,bn);
 		desti^=1; /* XOR with one to invert bit */
-		setbit(dr,bn,desti);
+            nd_setbit(dr,bn,desti);
 		break;
 	case 3 : /* BSET BAC */
-		setbit(dr,bn,getbit(_STS,_K));
+            nd_setbit(dr,bn,getbit(_STS,_K));
 		break;
 	case 4 : /* BSKP ZRO */
 		if (!getbit(dr,bn)) gPC++; /* Skip next instruction if zero */
@@ -2608,30 +2846,30 @@ void do_bops(ushort operand) {
 		if (getbit(dr,bn)==getbit(_STS,_K)) gPC++; /* Skip next instruction if equal */
 		break;
 	case 8 : /* BSTC */
-		setbit(dr,bn,(getbit(_STS,_K)^1));
-		setbit(_STS,_K,1);
+            nd_setbit(dr,bn,(getbit(_STS,_K)^1));
+            nd_setbit(_STS,_K,1);
 		break;
 	case 9 : /* BSTA */
-		setbit(dr,bn,getbit(_STS,_K));
-		setbit(_STS,_K,0);
+            nd_setbit(dr,bn,getbit(_STS,_K));
+            nd_setbit(_STS,_K,0);
 		break;
 	case 10 : /* BLDC */
-		setbit(_STS,_K,getbit(dr,bn)^1);
+            nd_setbit(_STS,_K,getbit(dr,bn)^1);
 		break;
 	case 11 : /* BLDA */
-		setbit(_STS,_K,getbit(dr,bn));
+            nd_setbit(_STS,_K,getbit(dr,bn));
 		break;
 	case 12 : /* BANC */
-		setbit(_STS,_K,((getbit(dr,bn)^1) & getbit(_STS,_K)));
+            nd_setbit(_STS,_K,((getbit(dr,bn)^1) & getbit(_STS,_K)));
 		break;
 	case 13 : /* BAND */
-		setbit(_STS,_K,(getbit(dr,bn) & getbit(_STS,_K)));
+            nd_setbit(_STS,_K,(getbit(dr,bn) & getbit(_STS,_K)));
 		break;
 	case 14 : /* BORC */
-		setbit(_STS,_K,((getbit(dr,bn)^1) | getbit(_STS,_K)));
+            nd_setbit(_STS,_K,((getbit(dr,bn)^1) | getbit(_STS,_K)));
 		break;
 	case 15 : /* BORA */
-		setbit(_STS,_K,(getbit(dr,bn) | getbit(_STS,_K)));
+            nd_setbit(_STS,_K,(getbit(dr,bn) | getbit(_STS,_K)));
 		break;
 	}
 	if (trace) {
@@ -2644,6 +2882,7 @@ ushort ShiftReg(ushort reg, ushort instr) {
 	bool isneg = ((instr & 0x0020)>>5) ? 1:0;
 	ushort offset = (isneg) ? (~((instr & 0x003F) | 0xFFC0)+1) : (instr & 0x003F);
 	ushort shifttype = ((instr >> 9) & 0x03);
+    ushort oldReg = reg;
 	int i,tmp,msb;
 	int m = getbit(_STS,_M);
 	tmp = m; /* just in case.. */
@@ -2666,7 +2905,11 @@ ushort ShiftReg(ushort reg, ushort instr) {
 				break;
 		}
 	}
-	setbit(_STS,_M,tmp);
+    nd_setbit(_STS,_M,tmp);
+    if (trace && (instr == 0154411 || instr == 0156564)) {
+        fprintf(tracefile,"Shift Reg=0%o -> 0%o, isNeg=%d, offset=%d, type=%d\n",
+                oldReg,reg,isneg,offset,shifttype);
+    }
 	return reg;
 }
 
@@ -2696,7 +2939,7 @@ ulong ShiftDoubleReg(ulong reg, ushort instr) {
 				break;
 		}
 	}
-	setbit(_STS,_M,tmp);
+    nd_setbit(_STS,_M,tmp);
 	return reg;
 }
 
@@ -2708,7 +2951,7 @@ void DoIDENT(char priolevel) {
 	int s;
 	ushort id = 0;
 	struct IdentChain *curr = gIdentChain;
-	while ((s = sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
+	while ((s = nd_sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
 		continue; /* Restart if interrupted by handler */
 	while(curr){
 		if (curr->level == priolevel) {
@@ -2718,11 +2961,12 @@ void DoIDENT(char priolevel) {
 		} else
 			curr=curr->next;
 	}
-	if (sem_post(&sem_int) == -1) { /* release interrupt lock */
+	if (nd_sem_post(&sem_int) == -1) { /* release interrupt lock */
 		if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DoIDENT\n");
 		CurrentCPURunMode = SHUTDOWN;
 	}
 	if (id) {
+        if (trace) fprintf(tracefile,"DoIDENT IOX A = 0%0o\n",id);
 		gA=id; /* Set A reg to ident code */
 		if (trace) trace_step(1,"A<=%06o",id);
 	} else {
@@ -2742,7 +2986,7 @@ void DoMOVB(ushort instr) {
 	int i;
 	ushort thebyte;
 	ushort addr_d, addr_s;
-
+    if (trace) fprintf(tracefile,"MOVB A=0%o, D=0%o, X=0%o, T=0%o\n",gA,gD,gX,gT);
 	addr_d = 0;
 	addr_s = 0;
 	dir = 0;
@@ -2769,18 +3013,22 @@ void DoMOVB(ushort instr) {
 		for (i=len-1;i>=0;i--) {
 			addr_s = source + ((i+s_lr)>>1); /* Word adress of byte to read */
 			thebyte = MemoryRead(addr_s,s_apt);
+            if (gIID & (IID_MEM_PROT | IID_PG_FAULT)) return ;
 			thebyte = ((i+d_lr)&1) ? thebyte : (thebyte >> 8) &0xff; /* right, LSB : left, MSB */
 			addr_d = dest + ((i+d_lr)>>1); /* Word adress of byte to write */
 			MemoryWrite(thebyte,addr_d,d_apt,((i+d_lr)&1));
+            if (gIID & (IID_MEM_PROT | IID_PG_FAULT)) return ;
 		}
 		i=0;
 	} else { /* low to high */
 		for (i=0;i<len;i++) {
 			addr_s = source + ((i+s_lr)>>1); /* Word adress of byte to read */
 			thebyte = MemoryRead(addr_s,s_apt);
+            if (gIID & (IID_MEM_PROT | IID_PG_FAULT)) return;
 			thebyte = ((i+d_lr)&1) ? thebyte : (thebyte >> 8) &0xff; /* right, LSB : left, MSB */
 			addr_d = dest + ((i+d_lr)>>1); /* Word adress of byte to write */
 			MemoryWrite(thebyte,addr_d,d_apt,((i+d_lr)&1));
+            if (gIID & (IID_MEM_PROT | IID_PG_FAULT)) return ;
 		}
 	}
 
@@ -2874,18 +3122,18 @@ void add_A_mem(ushort eff_addr, bool UseAPT) {
 // FIXME - ADD FLAG HANDLING CORRECTLY FOR C,O,Q FLAGS (CHECK AGAIN THINK WE MIGHT HAVE SUBTLE BUGS)
 
 	if (( temp > 0xFFFF) || ( temp <0)) {
-		setbit(_STS,_C,1);
+        nd_setbit(_STS,_C,1);
 		if ((oldreg & 0x8000) && ( data & 0x8000) && !(temp & 0x8000)) {
-			setbit(_STS,_Q,1);
+            nd_setbit(_STS,_Q,1);
 		} else {
-			setbit(_STS,_Q,0);
+            nd_setbit(_STS,_Q,0);
 		}
 	} else {
-		setbit(_STS,_C,0);
+		nd_setbit(_STS,_C,0);
 		if (!(oldreg & 0x8000) && !(data & 0x8000) && (temp & 0x8000)) {
-			setbit(_STS,_Q,1);
+            nd_setbit(_STS,_Q,1);
 		} else {
-			setbit(_STS,_Q,0);
+            nd_setbit(_STS,_Q,0);
 		}
 	}
 
@@ -2901,18 +3149,18 @@ void sub_A_mem(ushort eff_addr, bool UseAPT) {
  * FIXME - ADD FLAG HANDLING CORRECTLY FOR C,O,Q FLAGS (CHECK AGAIN THINK WE MIGHT HAVE SUBTLE BUGS)
  */
 	if ((temp > 0xFFFF) || (temp < 0)) {
-		setbit(_STS,_C,0);
+        nd_setbit(_STS,_C,0);
 		if ((oldreg & 0x8000) && (data & 0x8000) && !(temp & 0x8000)) {
-			setbit(_STS,_Q,1);
+            nd_setbit(_STS,_Q,1);
 		} else {
-			setbit(_STS,_Q,0);
+            nd_setbit(_STS,_Q,0);
 		}
 	} else {
-		setbit(_STS,_C,1);
+        nd_setbit(_STS,_C,1);
 		if (!(oldreg & 0x8000) && !(data & 0x8000) && (temp & 0x8000)) {
-			setbit(_STS,_Q,1);
+            nd_setbit(_STS,_Q,1);
 		} else {
-			setbit(_STS,_Q,0);
+            nd_setbit(_STS,_Q,0);
 		}
 	}
 
@@ -2948,15 +3196,18 @@ void rmpy(ushort instr){
 	b = (instr & 0x0007) ? (int) gReg->reg[gPIL][(instr & 0x0007)] : 0;
 	result = a * b;
 	if (abs(result) > INT_MAX) { /* Set O and Q */
-		setbit(_STS,_Q,1);
-		setbit(_STS,_O,1);
+		nd_setbit(_STS,_Q,1);
+		nd_setbit(_STS,_O,1);
 	} else {
 		;//:TODO: Carry???;
-		setbit(_STS,_Q,0);
-		setbit(_STS,_O,0);
+		nd_setbit(_STS,_Q,0);
+		nd_setbit(_STS,_O,0);
 	}
 	gA = (sshort)((result & 0xffff0000)>>16);
 	gD = (sshort)(result & 0x0000ffff);
+    if (trace) {
+        fprintf(tracefile,"RMPY: a=%d b=%d res=%d A=0%o D=0%o\n",a,b,result,gA,gD);
+    }
 	gPC++;
 	return;
 }
@@ -2974,11 +3225,11 @@ void mpy(ushort instr){
 	result = a * b;
 	if (debug) fprintf(debugfile,"MPY: %d = %d * %d\n",result,a,b);
 	if (abs(result) > 32767) { /* Set O and Q */
-		setbit(_STS,_Q,1);
-		setbit(_STS,_O,1);
+		nd_setbit(_STS,_Q,1);
+		nd_setbit(_STS,_O,1);
 	} else {
-		setbit(_STS,_Q,0);
-		setbit(_STS,_O,0);
+		nd_setbit(_STS,_Q,0);
+		nd_setbit(_STS,_O,0);
 	}
 	gA = (sshort)result;
 	gPC++;
@@ -2995,7 +3246,7 @@ ushort getbit(ushort regnum, ushort stsbit) {
 	return result;
 }
 
-void clrbit(ushort regnum, ushort stsbit) {
+void nd_clrbit(ushort regnum, ushort stsbit) {
 	ushort thebit;
 	thebit=(1 << stsbit) ^ 0xFFFF;
 	gReg->reg[CurrLEVEL][regnum] = (thebit & gReg->reg[CurrLEVEL][regnum]);
@@ -3011,28 +3262,29 @@ void clrbit(ushort regnum, ushort stsbit) {
 void setbit_STS_MSB(ushort stsbit, char val) {
 	int i;
 	ushort thebit = 0;
+    int fromLevel = 0;
+    if (0 /*stsbit == _PONI*/) {    // HBO
+        fromLevel = gPIL;   // If IRQ returns to lower level, we use paging as defined in that level.
+    }
 	if (val) {
 		thebit=(1 << stsbit);
-		for(i=0;i<=15;i++)
+		for(i=fromLevel;i<=15;i++)
 			gReg->reg[i][_STS] = gReg->reg[i][_STS] | thebit;
 	} else {
 		thebit=(1 << stsbit) ^ 0xFFFF;
-		for(i=0;i<=15;i++)
+		for(i=fromLevel;i<=15;i++)
 			gReg->reg[i][_STS] = gReg->reg[i][_STS] & thebit;
 	}
-
-
 }
 
 void setPIL(char val) {
 	int i;
-	for(i=0;i<=15;i++){
-		gReg->reg[i][_STS] &= 0xf0ff; /* clear PIL bits first */
-		gReg->reg[i][_STS] = gReg->reg[i][_STS] | ((val & 0x0f)<<8);
+	for(i=0;i<=15;i++) {
+        gReg->reg[i][_STS] = ( gReg->reg[i][_STS] & 0xf0ff) | ((val & 0x0f)<<8);
 	}
 }
 
-void setbit(ushort regnum, ushort stsbit, char val) {
+void nd_setbit(ushort regnum, ushort stsbit, char val) {
 	ushort thebit = 0;
 	if (val) {
 		thebit=(1 << stsbit);
@@ -3049,33 +3301,33 @@ ushort do_add(ushort a, ushort b, ushort k) {
 	tmp = ((int)a) + ((int)b) + ((int)k);
 	/* C (carry) */
 	if (tmp & 0xffff0000)
-		setbit(_STS,_C,1);
+		nd_setbit(_STS,_C,1);
 	else
-		setbit(_STS,_C,0);
+		nd_setbit(_STS,_C,0);
 	/* O(static overflow), Q (dynamic overflow) */
 	is_diff = (((1<<15)&a)^((1<<15)&b)); /* is bit 15 of the two operands different? */
 	if(!(is_diff) && (((1<<15)&a)^((1<<15)&tmp))) { /* if equal and result is different... */
-		setbit(_STS,_O,1);
-		setbit(_STS,_Q,1);
+        nd_setbit(_STS,_O,1);
+        nd_setbit(_STS,_Q,1);
 	} else
-		setbit(_STS,_Q,0);
+        nd_setbit(_STS,_Q,0);
 	return (ushort)tmp;
 }
 
 void AdjustSTS(ushort reg_a, ushort operand, int result) {
 	/* C (carry) */
 	if(result > 0xFFFF)
-		setbit(_STS,_C,1);
+        nd_setbit(_STS,_C,1);
 	else
-		setbit(_STS,_C,0);
+        nd_setbit(_STS,_C,0);
 
 	/* O(static overflow), Q (dynamic overflow) */
 	if(!(((1<<15) & reg_a)^((1<<15) & operand)) && (((1<<15) & reg_a)^((1<<15) & result))) {
-		setbit(_STS,_O,1);
-		setbit(_STS,_Q,1);
+		nd_setbit(_STS,_O,1);
+		nd_setbit(_STS,_Q,1);
 
 	} else
-		setbit(_STS,_Q,0);
+		nd_setbit(_STS,_Q,0);
 }
 
 /*
@@ -3084,11 +3336,11 @@ void AdjustSTS(ushort reg_a, ushort operand, int result) {
  * we have an error. this also means we only handle numbers
  * up to max positive int on the platform.
  */
-int aoct2int(char *str){
+int aoct2int(const char *str){
 	double tmp=0;
 	int num,count;
 
-	num=strlen(str);
+	num=(int)strlen(str);
 	for(count=0;num>0;num--) {
 		if((str[num-1]>='0') && (str[num-1]<='7')) {
 			tmp+=(double)((str[num-1]-'0')*pow((double)8,(double)count));
@@ -3105,12 +3357,12 @@ int aoct2int(char *str){
 /*
  *
  */
-void mopc_cmd(char *cmdstr, char cmdc){
+void mopc_cmd(const char *cmdstr, char cmdc){
 	int len;
-	int val;
+	int val = 0;
 	bool has_val = false;
 
-	len=strlen((const char*)cmdstr);
+	len=(int)strlen(cmdstr);
 	if (len > 255)
 		return;		/* This is BAAD, so we just silently fail the command at the moment */
 
@@ -3121,7 +3373,8 @@ void mopc_cmd(char *cmdstr, char cmdc){
 	switch (cmdc) {
 	case '.':
 		/* Set breakpoint */
-		if (!(has_val));	/*TODO: Check whats needed here */
+        if (!(has_val)) {	/*TODO: Check whats needed here */
+        }
 		if ((val>=0) && (val < 65536)){ /* valid range for 16 bit addr */
 			gReg->has_breakpoint = true;
 			gReg->breakpoint = (ushort) (val &0xffff);
@@ -3141,7 +3394,7 @@ void mopc_cmd(char *cmdstr, char cmdc){
 
 /* We run mopc as a thread here, but ticks it either from panel or rtc to get more correct nd behaviour */
 /* TODO:: NO ERROR CHECKING CURRENTLY DONE!!!! Need to see how real ND mopc behaves first */
-void mopc_thread(){
+void mopc_thread(void){
 	int s;
 	char ch;
 	char str[256];
@@ -3155,7 +3408,7 @@ void mopc_thread(){
 
 	while(CurrentCPURunMode != SHUTDOWN) {
 		/* This should trigger once every rtc/panel interrupt hopefully */
-		while ((s = sem_wait(&sem_mopc)) == -1 && errno == EINTR) /* wait for mopc lock to be free and grab it*/
+		while ((s = nd_sem_wait(&sem_mopc)) == -1 && errno == EINTR) /* wait for mopc lock to be free and grab it*/
 			continue; /* Restart if interrupted by handler */
 
 		if (debug) fprintf(debugfile,"(##)mopc tick...\n");
@@ -3195,7 +3448,7 @@ void mopc_thread(){
 						gPC=i;
 					}
 					CurrentCPURunMode = RUN;
-					if (sem_post(&sem_run) == -1) { /* release run lock */
+					if (nd_sem_post(&sem_run) == -1) { /* release run lock */
 						if (debug) fprintf(debugfile,"ERROR!!! sem_post failure mopc_thread\n");
 						CurrentCPURunMode = SHUTDOWN;
 					}
@@ -3217,26 +3470,38 @@ void mopc_thread(){
  * Change PK if conditions for it's setting are right.
  *
  */
-void checkPK() {
-	int s;
-	ushort lvl;
-	ushort i;
-	gPK=0;
-	while ((s = sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
-		continue; /* Restart if interrupted by handler */
+void checkPK_inInt(char *msg) {
+    ushort lvl;
+    ushort i;
+    gPK=0;
 	i = gPIE & gPID;
 //	if (debug) fprintf(debugfile,"PT DEB CheckPK: gPIE=%06o gPID=%06o i=%06o gPK=%d gPIL=%d\n",gPIE,gPID,i,gPK,gPIL);
-	if (i) { /* Do we have a pending interupt condition */
-		for (lvl=1;lvl<16;lvl++) {
-			gPK = (i & 1<<lvl) ? lvl : gPK; /* Will retain highest bit set as level*/
-//			if (debug) fprintf(debugfile,"PT DEB CheckPK: lvl=%d gPK=%d gPIL=%d\n",lvl,gPK,gPIL);
+	if (i) { /* Do we have a pending interrupt condition */
+		for (lvl=15;lvl>0;lvl--) {
+            if (i & 1 << lvl) {
+                gPK = lvl; /* Will retain highest bit set as level*/
+                if (trace) fprintf(tracefile,"PT DEB CheckPK: %s lvl=%d gPK=%d gPIL=%d\n",msg,lvl,gPK,gPIL);
+                break;
+            }
 		}
-	}
-	if (sem_post(&sem_int) == -1) { /* release interrupt lock */
-		if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DOMCL\n");
-		CurrentCPURunMode = SHUTDOWN;
-	}
+    } else {
+        if (gPK != 0) {
+            gPK = 0;
+            if (trace) fprintf(tracefile,"PT DEB CheckPK: %s gPK=%d gPIL=%d\n",msg,gPK,gPIL);
+        }
+    }
 }
+
+void checkPK(char *msg) {
+    while ((nd_sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
+        continue; /* Restart if interrupted by handler */
+    checkPK_inInt(msg);
+    if (nd_sem_post(&sem_int) == -1) { /* release interrupt lock */
+        if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DOMCL\n");
+        CurrentCPURunMode = SHUTDOWN;
+    }
+}
+
 
 /*
  * Main interruptsetting routine.
@@ -3244,20 +3509,20 @@ void checkPK() {
  * for those levels that has that. (LVL 14).
  */
 void interrupt(ushort lvl, ushort sub){
-	int s;
-	while ((s = sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
+	while ((nd_sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
 		continue; /* Restart if interrupted by handler */
 	if (lvl == 14) {
 		gIID |= sub;
-		if (gIID & gIIE) gPID|= (1<<14);
+		if (gIID & gIIE) gPID |= (1<<14);
 	} else {
 		gPID |= (1 << lvl) ;
 	}
-	if (sem_post(&sem_int) == -1) { /* release interrupt lock */
+    if (trace) fprintf(tracefile, "IRQ: PID=0x%04x IIE=0x%04x lvl=%d, sub=%d\n",gPID,gIIE,lvl,sub);
+    checkPK_inInt("IRQ");
+	if (nd_sem_post(&sem_int) == -1) { /* release interrupt lock */
 		if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DOMCL\n");
 		CurrentCPURunMode = SHUTDOWN;
 	}
-	checkPK();
 }
 
 /*
@@ -3267,9 +3532,15 @@ void interrupt(ushort lvl, ushort sub){
 bool IsShadowMemAccess(ulong addr) {
 	ushort pcr = gReg->reg_PCR[CurrLEVEL];
 	unsigned char ring_num = pcr & 0x03;
-	if((3 == ring_num) || !(STS_PONI)) {
-		if(((STS_SEXI) && (addr >= 0177000) && (addr <01000000)) || (!(STS_SEXI) && (addr >= 0177400) && (addr <01000000))) {
-			return true;
+	if ((3 == ring_num) || !(STS_PONI)) {
+        if (STS_SEXI) {
+            if (addr >= 0177000L && addr <= 0177777L) {
+                return true;
+            }
+        } else {
+            if (addr >= 0177400L && addr <= 0177777L) {
+                return true;
+            }
 		}
 	}
 	return false;
@@ -3282,6 +3553,8 @@ void PT_Write(ushort value, ushort addr, ushort byte_select){
 	ushort ptadd;
 	ulong temp;
 	ptadd = (STS_SEXI) ? (addr & 0x01ff) >>1 : (addr & 0x00ff);
+    ushort pt = (ptadd & 0xC0) >> 6;
+    ushort page = (ptadd & 0x3F);
 	temp = gPT->pt_arr[ptadd];
 //	if (debug) fprintf(debugfile,"PT_Write: addr=%06o(%d) ptadd=%d temp=%08x byte_select=%d value=%04x SEXI=%d\n",
 //		addr,addr,ptadd,temp,byte_select,value,STS_SEXI);
@@ -3309,10 +3582,15 @@ void PT_Write(ushort value, ushort addr, ushort byte_select){
 		break;
 	}
 //	if (debug) fprintf(debugfile,"PT_Write: ==> temp=%08x\n",temp);
-	gPT->pt_arr[ptadd]=temp;
+	gPT->pt_arr[ptadd] = temp;
+    char perm[5] = "----";
+    if (temp & ((ulong)1<<29)) perm[2]='X';
+    if (temp & ((ulong)1<<30)) perm[0]='R';
+    if (temp & ((ulong)1<<31)) perm[1]='W';
+    perm[3] = ((temp>>24) & 0x03) + '0';
 	if (trace & 0x08) fprintf(tracefile,
-		"#m (i,t,a) #v# (\"%d\",\"Write PageTables\",\"%08o\");\n",
-		(int)instr_counter,addr);
+		"%10d WT %08o,pt=%d,ptadd=0%o,virt=0%o,val=0%lo,page=%d,phys=0%lo,%s);\n",
+		(int)instr_counter,addr,pt,ptadd,page*1024,temp,page,(temp & 0xffff)*1024,perm);
 	return;
 }
 
@@ -3322,11 +3600,11 @@ void PT_Write(ushort value, ushort addr, ushort byte_select){
 ushort PT_Read(ushort addr){
 	ushort ptadd;
 //	ulong temp;
-	unsigned int temp;	/* This should be 32 bit always */
+    ulong temp;	/* This should be 32 bit always */
 	ushort res;
 	ptadd = (STS_SEXI) ? (addr & 0x01ff) >>1 : (addr & 0x00ff);
 	temp = gPT->pt_arr[ptadd];
-	if (debug) fprintf(debugfile,"PT_Read: addr=%06o(%d) ptadd=%d temp=%08x SEXI=%d\n",
+	if (debug) fprintf(debugfile,"PT_Read: addr=%06o(%d) ptadd=0%o temp=%08lx SEXI=%d\n",
 		addr,addr,ptadd,temp,STS_SEXI);
 	if(STS_SEXI)
 		res = (!(addr & 0x01)) ? ((temp & 0xffff0000) >> 16) : /* Even addr */
@@ -3346,7 +3624,7 @@ void PhysMemWrite(ushort value, ulong addr){
 		PT_Write(value,(ushort)addr,2); /* 2 = word write */
 		return;
 	}
-	addr &= (ND_Memsize); /* Mask it to the memory size we have to prevent coredumps :) */
+	addr &= (ND_Memsize-1); /* Mask it to the memory size we have to prevent coredumps :) */
 	p_phy_addr = &VolatileMemory.n_Array[addr];
 	*p_phy_addr = value;
 }
@@ -3360,7 +3638,7 @@ ushort PhysMemRead(ulong addr){
 		res = PT_Read((ushort)addr);
 		return(res); /* PT data */
 	}
-	addr &= (ND_Memsize); /* Mask it to the memory size we have to prevent coredumps :) */
+	addr &= (ND_Memsize-1); /* Mask it to the memory size we have to prevent coredumps :) */
 	return VolatileMemory.n_Array[addr];
 }
 
@@ -3387,7 +3665,7 @@ void MemoryWrite(ushort value, ushort addr, bool UseAPT, unsigned char byte_sele
 		PT_Write(value,addr,byte_select);
 		return;
 	}
-	if (STS_PONI) {
+	if (STS_PONI && (3 != ring_num)) {
 		if((STS_PTM) && UseAPT)
 			pt_num = (pcr>>7) & 0x03;	/* APT */
 		else
@@ -3412,7 +3690,7 @@ void MemoryWrite(ushort value, ushort addr, bool UseAPT, unsigned char byte_sele
 //						(int)instr_counter,PTe,pt_num,vpn);
 			}
 			if (trace & 0x08) fprintf(tracefile,
-				"#m (i,t,a) #v# (\"%d\",\"Write Fail(WPM)\",\"%08o\");\n",
+				"%010d WR Fail(WPM) %08o\n",
 				(int)instr_counter,addr);
 			return;
 //			error=true;
@@ -3425,7 +3703,7 @@ void MemoryWrite(ushort value, ushort addr, bool UseAPT, unsigned char byte_sele
 			gPGS = ((ushort)pt_num<<6) | vpn; /* Ring Violation */
 			interrupt(14,1<<2); /* Ring Protection Violation */
 			if (trace & 0x08) fprintf(tracefile,
-				"#m (i,t,a) #v# (\"%d\",\"Write Fail(Ring)\",\"%08o\");\n",
+				"%010d WR Fail(Ring) %08o\n",
 				(int)instr_counter,addr);
 			return;
 //			error=true;
@@ -3440,16 +3718,18 @@ void MemoryWrite(ushort value, ushort addr, bool UseAPT, unsigned char byte_sele
 
 //		if (debug) fprintf(debugfile,"WriteMemory: OK, PTe=%08x pt_num=%d vpn=%d ppn=%04x\n",PTe,pt_num,vpn,ppn);
 //		if (debug) fprintf(debugfile,"WriteMemory: OK, gPT->pt[pt_num][vpn]=%08x\n",gPT->pt[pt_num][vpn]);
+        ushort *physStart = &(VolatileMemory.n_Pages[0][0]);
+        ushort *physMem = &(VolatileMemory.n_Pages[ppn][addr & (((ushort)1<<10) - 1)]);
+        if (trace & 0x08) fprintf(tracefile,
+            "%010d WR %08o val=%04o phy=%lo\n",
+            (int)instr_counter,addr,value,(physMem-physStart));
 
 		p_phy_addr = &VolatileMemory.n_Pages[ppn][addr & (((ushort)1<<10) - 1)];
-		if (trace& 0x08) fprintf(tracefile,
-			"#m (i,t,a) #v# (\"%d\",\"Write (PT)\",\"%08o\");\n",
-			(int)instr_counter,addr);
 	} else {
 		p_phy_addr = &VolatileMemory.n_Array[addr];	/* Only 16 address bits in POF mode */
 		if (trace & 0x08) fprintf(tracefile,
-			"#m (i,t,a) #v# (\"%d\",\"Write ()\",\"%08o\");\n",
-			(int)instr_counter,addr);
+			"%010d WR %08o val=%04o\n",
+			(int)instr_counter,addr,value);
 	}
 
 	// :NOTE: ND memory is big endian but NDemulator is little endian!
@@ -3458,7 +3738,7 @@ void MemoryWrite(ushort value, ushort addr, bool UseAPT, unsigned char byte_sele
 		*p_phy_addr = (*p_phy_addr & 0xFF) | (value<<8);
 		break;
 	case 1:		/*Odd, which means LSB byte, or bits 7-0 */
-		*p_phy_addr = (*p_phy_addr & 0xFF00) | value;
+		*p_phy_addr = (*p_phy_addr & 0xFF00) | (value & 0xff);
 		break;
 	default:
 		*p_phy_addr = value;
@@ -3470,7 +3750,7 @@ void MemoryWrite(ushort value, ushort addr, bool UseAPT, unsigned char byte_sele
  * Read a word from memory.
  * Here we implement all Memory Management System functions.
  */
-ushort MemoryRead(ushort addr, bool UseAPT) {
+ushort MemoryReadInternal(ushort addr, bool UseAPT, bool handleException) {
 	ushort pcr = gReg->reg_PCR[CurrLEVEL];
 	unsigned char ring_num = pcr & 0x03;
 	ulong PTe;
@@ -3491,7 +3771,7 @@ ushort MemoryRead(ushort addr, bool UseAPT) {
 		return(res); /* PT data */
 	}
 
-	if(STS_PONI) {
+	if(STS_PONI && (3 != ring_num)) {
 		if((STS_PTM) && UseAPT)
 			pt_num = (pcr>>7) & 0x03;	// APT
 		else
@@ -3500,31 +3780,34 @@ ushort MemoryRead(ushort addr, bool UseAPT) {
 		PTe = gPT->pt[pt_num][vpn];
 
 		/* Check if not RPM(Read Permit bit is not set) */
-		if (!(PTe & ((ulong)1<<30))) {
+		if (handleException && !(PTe & ((ulong)1<<30))) {
 //			debug=1; /* PT DEBUGGING: remove once finished */
 			gPGS = ((ushort)1<<14) | ((ushort)pt_num<<6) | vpn;
 			if (!(PTe & ((ulong)0x07<<29))) {
 //				if (debug) fprintf(debugfile,"ReadMemory: Page Fault, PTe=%08x\n",PTe);
-				interrupt(14,1<<3); /* Page Fault */
+                interrupt(14,IID_PG_FAULT); /* Page Fault */
 			} else {
 //				if (debug) fprintf(debugfile,"ReadMemory: Memory protection Violation, PTe=%08x\n",PTe);
-				interrupt(14,1<<2); /* Memory Protection Violation */
+				interrupt(14,IID_MEM_PROT); /* Memory Protection Violation */
 			}
-			if (trace & 0x08) fprintf(tracefile,
-				"#m (i,t,a) #v# (\"%d\",\"Read Fail(RPM)\",\"%08o\");\n",
-				(int)instr_counter,addr);
+            if (trace & 0x08) {
+                fprintf(tracefile,
+                        "%10d RD Fail(RPM) %08o \n",
+                        (int)instr_counter,addr);
+                //disasm_dump();
+            }
 			return(0); /* TODO:: We should rethink MemoryRead to handle errors more gracefully. */
 //			error=true;
 		}
 
 		/* Check if ring number is too low */
-		if(((PTe>>24) & 0x03) > ring_num) {
+		if(handleException && ((PTe>>24) & 0x03) > ring_num) {
 // 			debug=1; /* PT DEBUGGING: remove once finished */
 			gPGS = ((ushort)pt_num<<6) | vpn;
 			interrupt(14,1<<2); /* Ring Protection Violation */
 //			if (debug) fprintf(debugfile,"ReadMemory: Ring Violation, PTe=%08x\n",PTe);
 			if (trace & 0x08) fprintf(tracefile,
-				"#m (i,t,a) #v# (\"%d\",\"Read Fail(Ring)\",\"%08o\");\n",
+				"%010d RD Fail(Ring) %08o \n",
 				(int)instr_counter,addr);
 			return(0); /* TODO:: We should rethink MemoryRead to handle errors more gracefully. */
 //			error=true;
@@ -3533,25 +3816,44 @@ ushort MemoryRead(ushort addr, bool UseAPT) {
 //		if (error) return;
 
 		/* Mark that the page was used */
-		gPT->pt[pt_num][vpn] |= ((ulong)0x01<<27); /* Set PGU */
-
+        if (handleException) {
+            gPT->pt[pt_num][vpn] |= ((ulong)0x01<<27); /* Set PGU */
+        }
 		/* Get physical page number */
 		ppn = (STS_SEXI) ? PTe & 0x3fff : PTe & 0x01ff;
 
 //		if (debug) fprintf(debugfile,"ReadMemory: OK, PTe=%08x pt_num=%d vpn=%d ppn=%04x\n",PTe,pt_num,vpn,ppn);
 //		if (debug) fprintf(debugfile,"ReadMemory: OK, gPT->pt[pt_num][vpn]=%08x\n",gPT->pt[pt_num][vpn]);
-
+        ushort *physStart = &(VolatileMemory.n_Pages[0][0]);
+        ushort *physMem = &(VolatileMemory.n_Pages[ppn][addr & (((ushort)1<<10) - 1)]);
+        ushort val = VolatileMemory.n_Pages[ppn][addr & (((ushort)1<<10) - 1)];
 		if (trace & 0x08) fprintf(tracefile,
-			"#m (i,t,a) #v# (\"%d\",\"Read (PT)\",\"%08o\");\n",
-			(int)instr_counter,addr);
-		return VolatileMemory.n_Pages[ppn][addr & (((ushort)1<<10) - 1)];
+			"%010d RD %08o val=0%o phy=0%lo\n",
+			(int)instr_counter,addr,val,(physMem-physStart));
+		return val;
 	} else {
+        ushort value = VolatileMemory.n_Array[addr];
 		if (trace & 0x08) fprintf(tracefile,
-			"#m (i,t,a) #v# (\"%d\",\"Read ()\",\"%08o\");\n",
-			(int)instr_counter,addr);
-		return VolatileMemory.n_Array[addr];	/* Only 16 address bits in POF mode */
+			"%010d RD %08o val=0%o\n",
+			(int)instr_counter,addr,value);
+		return value;	/* Only 16 address bits in POF mode */
 	}
 }
+
+/*
+ * Read a word from memory and handle exceptions.
+ */
+ushort MemoryRead(ushort addr, bool UseAPT) {
+    return MemoryReadInternal(addr, UseAPT, true);
+}
+
+/*
+ * Read a word from memory and DO NOT handle exceptions.
+ */
+ushort MemoryTraceRead(ushort addr, bool UseAPT) {
+    return MemoryReadInternal(addr, UseAPT, false);
+}
+
 
 ushort MemoryFetch(ushort addr, bool UseAPT) {
 	ushort pcr = gReg->reg_PCR[CurrLEVEL];
@@ -3573,7 +3875,7 @@ ushort MemoryFetch(ushort addr, bool UseAPT) {
 		return(res); /* PT data */
 	}
 
-	if(STS_PONI) {
+	if(STS_PONI && (3 != ring_num)) {
 		if((STS_PTM) && UseAPT)
 			pt_num = (pcr>>7) & 0x03;	// APT
 		else
@@ -3585,14 +3887,19 @@ ushort MemoryFetch(ushort addr, bool UseAPT) {
 		if (!(PTe & ((ulong)1<<29))) {
 // 			debug=1; /* PT DEBUGGING: remove once finished */
 			gPGS = ((ushort)3<<14) | ((ushort)pt_num<<6) | vpn;
-			if (!(PTe & ((ulong)0x07<<29)))
-				interrupt(14,1<<3); /* Page Fault */
-			else
-				interrupt(14,1<<2); /* Memory Protection Violation */
-			if (trace & 0x08) fprintf(tracefile,
-				"#m (i,t,a) #v# (\"%d\",\"Fetch Fail(FPM)\",\"%08o\");\n",
-				(int)instr_counter,addr);
-			return(0); /* TODO:: We should rethink MemoryFetch to handle errors more gracefully. */
+            if (trace & 0x08) fprintf(tracefile,
+                "%10d FT Fail(FPM) %08o, pt_num=%d, vpn=0%o, apt=%d\n",
+                (int)instr_counter,addr,pt_num,vpn,UseAPT);
+            if (CurrLEVEL == 14) {
+                // Page fault in Level 14 is a big problem.
+                CurrentCPURunMode = STOP;
+            } else {
+                if (!(PTe & ((ulong)0x07<<29)))
+                    interrupt(14,1<<3); /* Page Fault */
+                else
+                    interrupt(14,1<<2); /* Memory Protection Violation */
+            }
+            return(0); /* TODO:: We should rethink MemoryFetch to handle errors more gracefully. */
 //			error = true;
 		}
 
@@ -3602,7 +3909,7 @@ ushort MemoryFetch(ushort addr, bool UseAPT) {
 			gPGS = ((ushort)1<<15) | ((ushort)pt_num<<6) | vpn;
 			interrupt(14,1<<2); /* Ring Protection Violation */
 			if (trace & 0x08) fprintf(tracefile,
-				"#m (i,t,a) #v# (\"%d\",\"Fetch Fail(Ring)\",\"%08o\");\n",
+				"%010d FT Fail(Ring) %08o\n",
 				(int)instr_counter,addr);
 			return(0); /* TODO:: We should rethink MemoryFetch to handle errors more gracefully. */
 //			error = true;
@@ -3618,68 +3925,162 @@ ushort MemoryFetch(ushort addr, bool UseAPT) {
 
 //		if (debug) fprintf(debugfile,"FetchMemory: OK, PTe=%08x pt_num=%d vpn=%d ppn=%04x\n",PTe,pt_num,vpn,ppn);
 //		if (debug) fprintf(debugfile,"FetchMemory: OK, gPT->pt[pt_num][vpn]=%08x\n",gPT->pt[pt_num][vpn]);
-
+        ushort value = VolatileMemory.n_Pages[ppn][addr & (((ushort)1<<10) - 1)];
 		if (trace & 0x08) fprintf(tracefile,
-			"#m (i,t,a) #v# (\"%d\",\"Fetch (PT)\",\"%08o\");\n",
-			(int)instr_counter,addr);
-		return VolatileMemory.n_Pages[ppn][addr & (((ushort)1<<10) - 1)];
+			"%010d FT %08o val=0%o ppn=0%o\n",
+			(int)instr_counter,addr,value,ppn);
+		return value ;
 	} else {
+        ushort val = VolatileMemory.n_Array[addr];
 		if (trace & 0x08) fprintf(tracefile,
-			"#m (i,t,a) #v# (\"%d\",\"Fetch ()\",\"%08o\");\n",
-			(int)instr_counter,addr);
-		return VolatileMemory.n_Array[addr];	/* Only 16 address bits in POF mode */
+			"%010d FT %08o val=0%o\n",
+			(int)instr_counter,addr,val);
+		return val;	/* Only 16 address bits in POF mode */
 	}
 }
 
-void cpurun(){
+long currentTime(void)
+{
+    static long startTime = 0;
+    struct timeval timer;
+    gettimeofday(&timer, NULL);
+    long millis = (long)timer.tv_sec * 1000L + (timer.tv_usec/1000L);
+    if (startTime == 0) startTime = millis;
+    return millis - startTime;
+}
+
+void cpurun(void) {
+    bool load_state = true;
 	int s;
+    int lastLevel = 0;
 	ushort operand, p_now;
-	char disasm_str[256];
+    ushort lastop1 = 0;
+    ushort lastop2 = 0;
+    static int tracecounter = 0;
 //	debug=0; /* PT DEBUGGING: remove once finished */
 	prefetch(); /* works because gPC should already be setup when cpurun is called */
 	gReg->myreg_IR = gReg->myreg_PFB;
+    if (load_state) {
+        gA = 5;
+        ndfunc_iox(0303);   // enable console IRQ
+        gA = 1 | (1<<13);
+        ndfunc_iox(013);   // enable RTC IRQ and set RTC ready
+        cpustate(true,&instr_counter,
+                 &VolatileMemory,
+                 gReg,
+                 gPT,
+                 &gIdentChain);
+    }
+
 	while ((CurrentCPURunMode != STOP) && (CurrentCPURunMode != SHUTDOWN)) {
 		if (CurrentCPURunMode == SEMIRUN) { /* Here we should handle single step, breakpoints etc */
-			if(gReg->has_breakpoint)
-				if (gReg->breakpoint == gPC) {		/* TODO:: Check if we should execute the instruction at breakpoint address or not */
-					CurrentCPURunMode = STOP;
-					return;
-				}
-			if (gReg->has_instr_cntr)
-				if(gReg->instructioncounter > 0)
-					gReg->instructioncounter--;
-				else {
-					CurrentCPURunMode = STOP;
-					return;
-				}
+            if(gReg->has_breakpoint) {
+                if (gReg->breakpoint == gPC) {		/* TODO:: Check if we should execute the instruction at breakpoint address or not */
+                    CurrentCPURunMode = STOP;
+                    return;
+                }
+            }
+            if (gReg->has_instr_cntr) {
+                if(gReg->instructioncounter > 0) {
+                    gReg->instructioncounter--;
+                } else {
+                    CurrentCPURunMode = STOP;
+                    return;
+                }
+            }
 		}
-		instr_counter++;
+        instr_counter++;
+        // if (instr_counter > 50000000) CurrentCPURunMode = SHUTDOWN;
+        if (instr_counter >= 10005494 && !trace) {
+            trace_open();
+            trace = 15;
+        }
+        if (trace) {
+            tracecounter++;
+            if (tracecounter > 1000000) {
+                trace_shift_files();
+                tracecounter = 0;
+            }
+        }
 		if (trace) trace_pre(1,"S",gReg->reg[CurrLEVEL][0]);
 		operand=gReg->myreg_IR;
+        if ((lastop2 == 0144400 && lastop1 == 0144400 && operand == 0124376) ||
+            (lastop1 == 0124000 && operand == 0124000)) {
+            /* Running in dead loop */
+            usleep(10000); /* TODO: IRQ semaphore */
+            if (save_state_and_stop) {
+                cpustate(false,&instr_counter,
+                         &VolatileMemory,
+                         gReg,
+                         gPT,
+                         &gIdentChain);
+                CurrentCPURunMode = SHUTDOWN;
+                break;
+            }
+        }
+        lastop2 = lastop1;
+        lastop1 = operand;
 //		operand=MemoryFetch(gPC,true);
 		p_now=gPC;
+        if (trace) {
+            if (monitordata.nPC[CurrLEVEL] == p_now || monitordata.nPC[CurrLEVEL] == p_now-1) {
+                if (monitordata.opcount[CurrLEVEL] == 0) {
+                    monitordata.opcount[CurrLEVEL] = 1;
+                    monitordata.nPC[CurrLEVEL] = 0;
+                    fprintf(tracefile,"MON return from 0%o A=0%o T=0%o\n",monitordata.call[CurrLEVEL],gA,gT);
+                }
+            }
+        }
 		if (trace) trace_instr(operand);
 		if (DISASM) disasm_instr(gPC,operand);
 		do_op(operand);
-		if (trace & 0x16) trace_regs();
+        if (trace) {
+            if (lastLevel != CurrLEVEL) {
+                fprintf(tracefile,"%ld Level %d -> %d\n",currentTime(),lastLevel,CurrLEVEL);
+		                        lastLevel = CurrLEVEL;
+            }
+        }
+		if (trace & 0x10) trace_regs();
+        while ((s = nd_sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
+            continue; /* Restart if interrupted by handler */
 		if(STS_IONI && (gPK != gPIL)) { /* Time to change runlevel */
-			while ((s = sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
-				continue; /* Restart if interrupted by handler */
 			gPVL = gPIL; /* Save current runlevel */
 			setPIL(gPK); /* Change to new runlevel */
-			if (sem_post(&sem_int) == -1) { /* release interrupt lock */
-				if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DOMCL\n");
-				CurrentCPURunMode = SHUTDOWN;
-			}
+            if (nd_sem_post(&sem_int) == -1) { /* release interrupt lock */
+                if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DOMCL\n");
+                CurrentCPURunMode = SHUTDOWN;
+            }
 			prefetch(); /* Ok, since we are changing runlevel, we chuck old prefetched instruction and fetch a new one. */
-		}
+            // If prefetch fails, we need to fetch another instruction:
+            while ((s = nd_sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
+                continue; /* Restart if interrupted by handler */
+            if (STS_IONI && (gPK != gPIL)) {
+                gPVL = gPIL; /* Save current runlevel */
+                setPIL(gPK); /* Change to new runlevel */
+                if (nd_sem_post(&sem_int) == -1) { /* release interrupt lock */
+                    if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DOMCL\n");
+                    CurrentCPURunMode = SHUTDOWN;
+                }
+                prefetch();
+            } else {
+                if (nd_sem_post(&sem_int) == -1) { /* release interrupt lock */
+                    if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DOMCL\n");
+                    CurrentCPURunMode = SHUTDOWN;
+                }
+            }
+        } else {
+            if (nd_sem_post(&sem_int) == -1) { /* release interrupt lock */
+                if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DOMCL\n");
+                CurrentCPURunMode = SHUTDOWN;
+            }
+        }
 		if (trace) trace_post(1,"S",gReg->reg[CurrLEVEL][0]);
 		if (trace) trace_flush();
 		gReg->myreg_IR = gReg->myreg_PFB; /* prefetch of next instruction should have been done while executing current one. */
 	}
 }
 
-void cpu_thread(){
+void cpu_thread(void) {
 	int s;
 	if (debug) fprintf(debugfile,"(##)cpu_thread running...\n");
 	if (debug) fflush(debugfile);
@@ -3693,14 +4094,14 @@ void cpu_thread(){
 
 		/* signal that we are now stopped and the routine waiting on us can continue */
 		if(CurrentCPURunMode != SHUTDOWN) {
-			if (sem_post(&sem_stop) == -1) { /* release stop lock */
+			if (nd_sem_post(&sem_stop) == -1) { /* release stop lock */
 				if (debug) fprintf(debugfile,"ERROR!!! sem_post failure cpu_thread\n");
 				CurrentCPURunMode = SHUTDOWN;
 			}
 		}
 
 		/* Wait for run signal */
-		while ((s = sem_wait(&sem_run)) == -1 && errno == EINTR) /* wait for run lock to be free */
+		while ((s = nd_sem_wait(&sem_run)) == -1 && errno == EINTR) /* wait for run lock to be free */
 			continue; /* Restart if interrupted by handler */
 	}
 }
@@ -3741,8 +4142,10 @@ void RemIdentChain(struct IdentChain * elem){
 	} else if (n){
 		n->prev=NULL;
 		gIdentChain=n;
+        gPID |= (1 << gIdentChain->level);    // Retrigger interrupt for next
 	} else if (p) {
 		p->next=NULL;
+        gPID |= (1 << gIdentChain->level);    // Retrigger interrupt for next
 	} else {
 		gIdentChain=NULL;
 	}
@@ -3766,7 +4169,7 @@ void AddMemTrace(unsigned int addr, char whom){
 	curr->next=new;
 }
 
-void DelMemTrace(){
+void DelMemTrace(void) {
 	struct MemTraceList * curr, * head;
 	head=gMemTrace;
 	while(head){
@@ -3777,7 +4180,7 @@ void DelMemTrace(){
 	gMemTrace=head;
 }
 
-void PrintMemTrace(){
+void PrintMemTrace(void) {
 	struct MemTraceList * curr;
 	char temp;
 	curr=gMemTrace;
@@ -3812,7 +4215,7 @@ void Instruction_Add(int start, int stop, void *funcpointer) {
  * Add IO handler addresses in this function
  * This also thus actually acts as the new instruction parser also.
  */
-void Setup_Instructions () {
+void Setup_Instructions(void) {
 	Instruction_Add(0000000,0177777,&ndfunc_stz);			/* First make all instructions by default point to illegal_instr  */
 
 	Instruction_Add(0000000,0003777,&ndfunc_stz);			/* STZ  */
@@ -3965,10 +4368,10 @@ void Setup_Instructions () {
 	case ND110CE:		/* Should become a NOOOP on these */
 	case ND110CX:
 	case ND110PCX:
-		Instruction_Add(0143500,0143500,&unimplemented_instr);	/* LWCS */
+		Instruction_Add(0143500,0143500,&unimplemented_noop);	/* LWCS */
 		break;
 	default:
-		Instruction_Add(0143500,0143500,&unimplemented_instr);	/* LWCS */
+		Instruction_Add(0143500,0143500,&unimplemented_noop);	/* LWCS */
 		break;
 	}
 
@@ -4041,3 +4444,8 @@ void Setup_Instructions () {
 									/* Bit operations, 16 of them, 4 BSET,4 BSKP and 8 others */
 }
 
+
+void cpu_savestate(void)
+{
+    save_state_and_stop = true;
+}

@@ -2,6 +2,7 @@
  * nd100em - ND100 Virtual Machine
  *
  * Copyright (c) 2006-2008 Roger Abrahamsson
+ * Copyright (c) 2024 Heiko Bobzin
  *
  * This file is originated from the nd100em project.
  *
@@ -26,24 +27,24 @@
 
 /* GLOBAL VARS */
 
+#ifndef _DEF_CPU_H
+#define _DEF_CPU_H
+extern char *regn[] ;
+extern char *regn_w[] ;
 
-char *regn[] = {"S","D","P","B","L","A","T","X","U0","U1"};
-char *regn_w[] = {"DS","DD","DP","DB","DL","DA","DT","DX"};
+extern char *intregn_r[] ;
+extern char *intregn_w[] ;
 
-char *intregn_r[] = {"PANS","STS","OPR","PGS","PVL","IIC","PID","PIE","CSR","ACTL", "ALD" ,"PES","PGC","PEA","16","17"};
-char *intregn_w[] = {"PANC","STS","LMP","PCR", "4", "IIE","PID","PIE","CCL","LCIL","UCILR","13", "14", "15" ,"16","17"};
+extern char *relmode_str[] ;
+extern char *shtype_str[];
 
-char *relmode_str[] ={"",",B ","I ","I ,B ",",X ",",X ,B ","I ,X ","I ,B ,X "};
-char *shtype_str[] ={"","ROT ","ZIN ","LIN "};
+extern char *skiptype_str[];
+extern char *skipregn_dst[];
+extern char *skipregn_src[];
 
-char *skiptype_str[] = {"EQL","GEQ","GRE","MGRE","UEQ","LSS","LST","MLST"};
-char *skipregn_dst[] = {"0","DD","DP","DB","DL","DA","DT","DX"};
-char *skipregn_src[] = {"0","SD","SP","SB","SL","SA","ST","SX"};
+extern char *bopstsbit_str[];
 
-char *bopstsbit_str[] = {"SSPTM","SSTG","SSK","SSZ","SSQ","SSO","SSC","SSM","","","","","","","",""};
-
-char *bop_str[] = {"BSET ZRO","BSET ONE","BSET BCM","BSET BAC","BSKP ZRO","BSKP ONE",
-		   "BSKP BCM","BSKP BAC","BSTC","BSTA","BLDC","BLDA","BANC","BAND","BORC","BORA"};
+extern char *bop_str[] ;
 
 
 extern FILE *tracefile;
@@ -62,15 +63,15 @@ extern int emulatemon;
 
 /* NOTE: Memory part not implemented yet!! */
 
-_NDRAM_		VolatileMemory;
-_NDPT_		PageTable;
-_RUNMODE_	CurrentCPURunMode;
-_CPUTYPE_	CurrentCPUType;
+extern _NDRAM_		VolatileMemory;
+extern _NDPT_		PageTable;
+extern _RUNMODE_	CurrentCPURunMode;
+extern _CPUTYPE_	CurrentCPUType;
 
-struct CpuRegs *gReg;
-union NewPT *gPT;
-struct MemTraceList *gMemTrace;
-struct IdentChain *gIdentChain;
+extern struct CpuRegs *gReg;
+extern union NewPT *gPT;
+extern struct MemTraceList *gMemTrace;
+extern struct IdentChain *gIdentChain;
 
 #define ND_Memsize	(sizeof(VolatileMemory)/sizeof(ushort))
 
@@ -83,20 +84,21 @@ struct IdentChain *gIdentChain;
  * It also makes possible modifications to instruction handling at runtime, for possible
  * implementation of USER instructions etc.
  */
-void (*instr_funcs[65536])(ushort);
+extern void (*instr_funcs[])(ushort);
 
 /*************************************************/
+extern unsigned long instr_counter;
 
 /* We have a maximum of 64Kword device register addresses*/
-unsigned short devices[65536];
+extern unsigned short devices[];
 
-unsigned short MON_RUN=1;
+extern unsigned short MON_RUN;
 
-unsigned short MODE_RUN=1;
-unsigned short MODE_OPCOM=0;
+extern unsigned short MODE_RUN;
+extern unsigned short MODE_OPCOM;
 
 /* This variable tells us if we have the display panel option */
-unsigned short PANEL_PROCESSOR=0;
+extern unsigned short PANEL_PROCESSOR;
 
 void ndfunc_stz(ushort operand);
 void ndfunc_sta(ushort operand);
@@ -179,7 +181,7 @@ void ndfunc_lbyt(ushort operand);
 void ndfunc_sbyt(ushort operand);
 void ndfunc_mix3(ushort operand);
 
-void OpToStr(char *opstr, ushort operand);
+void OpToStr(char *opstr, ushort pc, ushort operand, ushort *absAddr, char *accessType);
 void do_op(unsigned short operand);
 void new_regop (unsigned short operand);
 void regop (unsigned short operand);
@@ -201,7 +203,7 @@ void DoSRB(ushort operand);
 void DoLRB(ushort operand);
 void DoMCL(ushort instr);
 void DoMST(ushort instr);
-void DoCLEPT();
+void DoCLEPT(void);
 void DoTRA(ushort instr);
 void DoTRR(ushort instr);
 void DoWAIT(ushort instr);
@@ -217,8 +219,8 @@ void do_debug_txt(char *txt);
 void debug_regs(void);
 void setbit_STS_MSB(ushort stsbit, char val);
 void AdjustSTS(ushort reg_a, ushort operand, int result);
-void clrbit(unsigned short regnum, unsigned short stsbit);
-void setbit(unsigned short regnum, unsigned short stsbit, char val);
+void nd_clrbit(unsigned short regnum, unsigned short stsbit);
+void nd_setbit(unsigned short regnum, unsigned short stsbit, char val);
 unsigned short getbit(unsigned short regnum, unsigned short stsbit);
 int getch (void);
 char mygetc (void);
@@ -235,32 +237,32 @@ void MemoryWrite(ushort value, ushort addr, bool is_P_relative, unsigned char by
 ushort MemoryRead(ushort addr, bool is_P_relative);
 ushort MemoryFetch(ushort addr, bool is_P_relative);
 void AddMemTrace(unsigned int addr, char whom);
-void DelMemTrace();
-void PrintMemTrace();
+void DelMemTrace(void);
+void PrintMemTrace(void);
 void AddIdentChain(char lvl, ushort identnum, int callerid);
 void RemIdentChain(struct IdentChain * elem);
-void checkPK (void);
+void checkPK (char *msg);
 void interrupt(ushort lvl,ushort sub);
 void illegal_instr(ushort operand);
 void unimplemented_instr(ushort operand);
-void prefetch();
-void cpu_thread();
-void mopc_thread();
+void prefetch(void);
+void cpu_thread(void);
+void mopc_thread(void);
 
 void Instruction_Add(int start, int stop, void *funcpointer);
-void Setup_Instructions ();
+void Setup_Instructions (void);
 
 extern void mon (unsigned char monnum);
 extern void io_op (ushort ioadd);
-extern void Setup_IO_Handlers ();
+extern void Setup_IO_Handlers (void);
 extern unsigned short extract_opcode(unsigned short instr);
-extern int sectorread (char cyl, char side, char sector, unsigned short *addr);
+extern int sectorread (int diskNumber, char cyl, char side, char sector, unsigned short *addr);
 extern void trace_step(int num,...);
 extern void trace_pre(int num,...);
 extern void trace_post(int num,...);
 extern void trace_instr(ushort instr);
-extern void trace_regs();
-extern void trace_flush();
+extern void trace_regs(void);
+extern void trace_flush(void);
 extern int mopc_in(char *chptr);
 extern void mopc_out(char ch);
 extern int NDFloat_Div(unsigned short int* p_a,unsigned short int* p_b,unsigned short int* p_r);
@@ -277,5 +279,7 @@ extern void disasm_setlbl(ushort addr);
 extern void disasm_userel(ushort addr, ushort where);
 extern void disasm_set_isdata(ushort addr);
 
-extern sem_t sem_pap;
+extern nd_sem_t sem_int;
+extern nd_sem_t sem_pap;
 extern struct display_panel *gPAP;
+#endif

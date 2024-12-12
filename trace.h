@@ -2,6 +2,7 @@
  * nd100em - ND100 Virtual Machine
  *
  * Copyright (c) 2006-2008 Roger Abrahamsson
+ * Copyright (c) 2024 Heiko Bobzin
  *
  * This file is originated from the nd100em project.
  *
@@ -21,21 +22,20 @@
  */
 
 char tracename[]="tracefile.log";
-char tracetype[]="a";
+char tracetype[]="w";
 FILE *tracefile;
 int trace;
 
 
 char trace2name[]="trace2file.log";
-char trace2type[]="a";
+char trace2type[]="w";
 FILE *trace2file;
 
 char disasm_fname[]="nd100em.disasm.log";
-char disasm_ftype[]="a";
+char disasm_ftype[]="w+";
 FILE *disasm_file;
 
 
-int DISASM;
 int disasm_ctr;
 
 struct disasm_entry {
@@ -59,16 +59,16 @@ volatile int ts_step = 0;
 char ts_block[MAXTSARR][MAXTSSTR];
 
 extern char *regn[];
-extern double instr_counter;
+extern long int instr_counter;
 extern struct CpuRegs *gReg;
 
-extern void OpToStr(char *opstr, ushort operand);
+extern void OpToStr(char *opstr, ushort pc, ushort operand, ushort *absAddr, char *accessType);
 extern ushort extract_opcode(ushort instr);
 
 void trace_instr(ushort instr);
 void disasm_addword(ushort addr, ushort myword);
-void disasm_init();
-void disasm_dump();
+void disasm_init(void);
+void disasm_dump(void);
 void disasm_instr(ushort addr, ushort instr);
 void disasm_exr(ushort addr, ushort instr);
 void disasm_setlbl(ushort addr);

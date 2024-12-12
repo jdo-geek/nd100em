@@ -4,6 +4,7 @@
  * Copyright (c) 2008 Roger Abrahamsson
  * Copyright (c) 2008 Zdravko Dimitrov
  * Copyright (c) 2008 Goran Axelsson
+ * Copyright (c) 2024 Heiko Bobzin
  *
  * This file is originated from the nd100em project.
  *
@@ -28,29 +29,44 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <signal.h>
-#include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <fcntl.h>
 #include "nd100.h"
+#include "nd100lib.h"
 #include "io.h"
+#include "cpu.h"
+
+extern void trace_open(void);
 
 /* console synchronization*/
-sem_t sem_cons;
+nd_sem_t sem_cons;
 
 /* io synchronization*/
-sem_t sem_io;
+nd_sem_t sem_io;
 
 /* floppy synchronization*/
-sem_t sem_floppy;
+nd_sem_t sem_floppy;
+
+/* hdd synchronization*/
+nd_sem_t sem_hdd;
 
 /* panel processor synchronization*/
-sem_t sem_pap;
+nd_sem_t sem_pap;
 
 struct display_panel *gPAP;
+
+//char script_console[] = "LOAD MAC\r10,0$\r\t110,0$";
+//char script_console[] = "LOAD MAC\r)HENT\r\r22!";
+char script_console[] = "LOAD MAC\r)REDEF\r4\rF\r)HENT\r\t322!";
+//char script_console[] = "LOAD MAC\r";
+
+char *script_console_in_ptr = &script_console[0];
+static int diskNumber = 0;
 
 /*
  * IOX and IOXT operation, dummy for now.
@@ -63,17 +79,53 @@ void io_op (ushort ioadd) {
 				implement io calls. */
 }
 
+static
+void hdd_dev_clear(struct hdd_data *dev) {
+    memset(dev,0,sizeof(struct hdd_data));
+    dev->on_cylinder = false;
+    dev->finished = true;
+}
+
+#define HDD_IRQ_ID      101
+#define FLOPPY_ID       201
+#define CONSOLE_IN_ID   301
+#define CONSOLE_OUT_ID  401
+
+static
+void genIRQ(ushort level, ushort ident, ushort chainId)
+{
+    while ((nd_sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
+        continue;       /* Restart if interrupted by handler */
+    gPID |= (1 << level) ;
+    AddIdentChain(level,ident,chainId); /* Add interrupt to ident chain, lvl13, ident code 1, and identify us */
+    if (nd_sem_post(&sem_int) == -1) { /* release interrupt lock */
+        if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DOMCL\n");
+        CurrentCPURunMode = SHUTDOWN;
+    }
+    if (debug) fprintf(debugfile,"gen IRQ %d 0%o 0%o\n",level,ident,chainId);
+    interrupt(level,0);
+}
+
 /*
  * Access to unpopulated IO area
  */
 void Default_IO(ushort ioadd) {
-	mysleep(0,10); /* Sleep 10us for IOX timeout time simulation */
-	if(gReg->reg_IIE & 0x80) {
-		if (trace & 0x01) fprintf(tracefile,
-			"#o (i,d) #v# (\"%d\",\"No IO device, IOX error interrupt after 10 us.\");\n",
-			(int)instr_counter);
-		interrupt(14,1<<7); /* IOX error lvl14 */
-	}
+    if (1) {
+        if (ioadd & 1) {
+            // Write...
+        } else {
+            // Read...
+            gA = 0;
+        }
+    } else {
+        mysleep(0,10); /* Sleep 10us for IOX timeout time simulation */
+        if(gReg->reg_IIE & 0x80) {
+            if (trace & 0x01) fprintf(tracefile,
+                                      "#o (i,d) #v# (\"%d\",\"No IO device, IOX error interrupt after 10 us.\");\n",
+                                      (int)instr_counter);
+            interrupt(14,1<<7); /* IOX error lvl14 */
+        }
+    }
 }
 
 /*
@@ -84,94 +136,113 @@ void Floppy_IO(ushort ioadd) {
 	int a = ioadd & 0x07;
 	ushort tmp;
 	struct floppy_data *dev = iodata[ioadd];
-	if (debug) fprintf(debugfile,"Floppy_IO: IOX %d - A=%d\n",ioadd,gA);
-	fflush(debugfile);
 	switch(a) {
 	case 0: /* IOX RDAD - Read data buffer */
-		while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
+		while ((s = nd_sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
 			continue; /* Restart if interrupted by handler */
 
 		if (dev->bufptr >= 0 && dev->bufptr < FDD_BUFSIZE) {
 			gA = dev->buff[dev->bufptr];
+            if (debug) fprintf(debugfile, "Floppy: read buffer %d -> 0%03o 0x%02X\n",dev->bufptr,gA,gA);
 			dev->bufptr++;
 			if(dev->bufptr >= FDD_BUFSIZE)
 				dev->bufptr = 0;
 		}
-
-		if (sem_post(&sem_io) == -1) { /* release io lock */
+		if (nd_sem_post(&sem_io) == -1) { /* release io lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure Floppy_IO\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
 		break;
 	case 1: /* IOX WDAT - Write data buffer */
-		while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
+		while ((s = nd_sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
 			continue; /* Restart if interrupted by handler */
 
 		if (dev->bufptr>=0 && dev->bufptr<FDD_BUFSIZE) {
 			dev->buff[dev->bufptr] = gA;
+            if (debug) fprintf(debugfile, "Floppy: write buffer %d -> 0%03o 0x%02X\n",dev->bufptr,gA,gA);
 			dev->bufptr++;
 			if(dev->bufptr >= FDD_BUFSIZE)
 				dev->bufptr = 0;
 		}
 
-		if (sem_post(&sem_io) == -1) { /* release io lock */
+		if (nd_sem_post(&sem_io) == -1) { /* release io lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure Floppy_IO\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
 		break;
 	case 2: /* IOX RSR1 - Read status register No. 1 */
-		while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
+		while ((s = nd_sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
 			continue; /* Restart if interrupted by handler */
 
-		gA = 0; /* Put A in consistent state */
-		gA |= (dev->irq_en) ? (1<<1) : 0;	/* IRQ enabled (bit 1)*/
-		gA |= (dev->busy) ? (1<<2) : 0;		/* Device is busy */
-		gA |= (dev->sense) ? (1<<4) : 0;	/* interrupt set, check STS reg 2 */
-
-		if (debug) fprintf(debugfile,"Floppy_IO: IOX %o RSR1 - A=%04x\n",ioadd,gA);
-
-		if (sem_post(&sem_io) == -1) { /* release io lock */
+		gA = 0; /* Put A in consistent state   bit 0: (1) not used */
+		gA |= (dev->irq_en) ? (1<<1) : 0;	/* bit 1: (2) IRQ enabled */
+        if (dev->busy_counter > 0) {
+            dev->busy_counter--;
+            gA |= (1<<2) ;        /* bit 2: (4) Device is busy (bit 2) */
+        } else {
+            gA |= (dev->busy) ? (1<<2) : 0;		/* bit 2: (4) Device is busy (bit 2) */
+            gA |= (!dev->busy) ? (1<<3) : 0;    /* bit 3: (8) Device is ready for transfer */
+            gA |= (dev->sense) ? (1<<4) : 0;	/* Bit 4: (16) from RSR2, interrupt set, check STS reg 2 */
+            /* Bit 5: Deleted record */
+            gA |= (dev->rwComplete) ? (1<<6) : 0;    /* bit 6: (64) R/W complete */
+            gA |= (dev->seekComplete) ? (1<<7) : 0;    /*  Bit 7: (128) Seek complete */
+        }
+        if (debug) fprintf(debugfile,"Floppy: IOX %o RSR1 - A=0x%04x\n",ioadd,gA);
+/* Bit 8: Timeout */
+		if (nd_sem_post(&sem_io) == -1) { /* release io lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure Floppy_IO\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
 		break;
 	case 3: /* IOX WCWD - Write control word */
-		while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
+		while ((s = nd_sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
 			continue; /* Restart if interrupted by handler */
-
-		if ((gA >> 1) & 0x01) {
+            ushort tempA = gA;
+		if ((tempA >> 1) & 0x01) {
 			dev->irq_en = 1;
 		}
-		if ((gA >> 3) & 0x01) {
+        if ((tempA >> 2) & 0x01) {  /* Bit 2 -> Autoload mode */
+            /* Seek to track 0, read sector 1 (first) into buffer */
+            dev->track = 48;
+            dev->sector = 1;
+            dev->bufptr_read = 0;
+        }
+		if ((tempA >> 3) & 0x01) {  /* Bit 3 (8) -> Test mode */
 			dev->test_mode = 1;
 		}
-		if ((gA >> 4) & 0x01) {		/* Device clear */
-			dev->selected_drive = -1;
+		if ((tempA >> 4) & 0x01) {		/* (16) Device clear and deselect */
+			// dev->selected_drive = -1;
+            // dev->track = 0;          /* Do not reset the track. */
+			dev->bufptr = 0;
+            dev->sector = 1;
+		}
+		if ((tempA >> 5) & 0x01) {		/* (32) Clear Interface buffer address */
+            dev->bufptr_read = 0;
 			dev->bufptr = 0;
 		}
-		if ((gA >> 5) & 0x01) {		/* Clear Interface buffer address */
-			dev->bufptr = 0;
-		}
-		if (gA & 0xff00) {
+		if (tempA & 0xff00) {
 			dev->busy = 1;
-			dev->command = ((gA & 0xff00 ) >>8);
+            dev->busy_counter = dev->irq_en ? 0 : 10;
+            dev->rwComplete = 0;
+            dev->seekComplete = 0;
+			dev->command = ((tempA & 0xff00 ) >>8);
 			/* TRIGGER FLOPPY THREAD */
-			if (sem_post(&sem_floppy) == -1) { /* release floppy lock */
+			if (nd_sem_post(&sem_floppy) == -1) { /* release floppy lock */
 				if (debug) fprintf(debugfile,"ERROR!!! sem_floppy failure Floppy_IO\n");
 				CurrentCPURunMode = SHUTDOWN;
 			}
 
 		}
 
-		if (debug) fprintf(debugfile,"Floppy_IO: IOX %o WCWD - A=%04x\n",ioadd,gA);
+		if (debug) fprintf(debugfile,"Floppy: IOX %o WCWD - A=0x%04x\n",ioadd,tempA);
 
-		if (sem_post(&sem_io) == -1) { /* release io lock */
+		if (nd_sem_post(&sem_io) == -1) { /* release io lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure Floppy_IO\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
 		break;
 	case 4: /* IOX RSR2 - Read status register No. 2 */
-		while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
+		while ((s = nd_sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
 			continue; /* Restart if interrupted by handler */
 
 		gA = 0; /* Put A in consistent state */
@@ -179,24 +250,28 @@ void Floppy_IO(ushort ioadd) {
 		gA |= (dev->write_protect) ? (1<<9) : 0;	/* set if trying to write to write protected diskette (file) */
 		gA |= (dev->missing) ? (1<<11) : 0;		/* sector missing / no am */
 
-		if (debug) fprintf(debugfile,"Floppy_IO: IOX %o RSR2 - A=%04x\n",ioadd,gA);
+		if (debug) fprintf(debugfile,"Floppy: IOX %o RSR2 - A=0x%04x\n",ioadd,gA);
 
-		if (sem_post(&sem_io) == -1) { /* release io lock */
+		if (nd_sem_post(&sem_io) == -1) { /* release io lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure Floppy_IO\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
 		break;
 	case 5: /* IOX WDAD - Write Drive Address/ Write Difference */
-		while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
+		while ((s = nd_sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
 			continue; /* Restart if interrupted by handler */
 
-		if (gA | 0x1) { /* Write drive address */
-			if (debug) fprintf(debugfile,"IOX 1565 - Write Drive Address...\n");
+		if (gA & 0x1) { /* Write drive address */
+			if (debug) fprintf(debugfile,"Floppy: IOX 1565 - Write Drive Address... 0x%04x\n",gA);
 			tmp = (gA >> 8) & 0x07;
-			if (tmp <4)
-				dev->selected_drive = tmp;
-			if ((gA >> 11) & 0x01)
-				dev->selected_drive = -1;
+            if (tmp <4) {
+                if (debug) fprintf(debugfile,"Floppy: IOX 1565 - Select drive 0x%04x\n",tmp);
+                dev->selected_drive = tmp;
+            }
+            if ((gA >> 11) & 0x01) {
+                if (debug) fprintf(debugfile,"Floppy: IOX 1565 - Select no drive\n");
+                dev->selected_drive = -1;
+            }
 			tmp = (gA >> 14) & 0x03;
 			switch (tmp) {
 			case 0:
@@ -217,23 +292,28 @@ void Floppy_IO(ushort ioadd) {
 				break;
 			}
 		} else { /* Write difference */
-			if (debug) fprintf(debugfile,"IOX 1565 - Write Difference...\n");
 			tmp= (gA >> 8) & 0x7f;
 			if(dev->selected_drive != -1) {
 				dev->unit[dev->selected_drive]->diff_track = tmp;
 				dev->unit[dev->selected_drive]->dir_track = (gA >> 15 ) & 0x01;
-			}
+                if (debug) fprintf(debugfile,"Floppy: IOX 1565 - Write Difference...%d %d \n",
+                                   dev->unit[dev->selected_drive]->diff_track,
+                                   dev->unit[dev->selected_drive]->dir_track);
+            } else {
+                if (debug) fprintf(debugfile,"Floppy: IOX 1565 - Write Difference... NO DRIVE\n");
+            }
 		}
 
-		if (sem_post(&sem_io) == -1) { /* release io lock */
+		if (nd_sem_post(&sem_io) == -1) { /* release io lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure Floppy_IO\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
 		break;
 	case 6: /* Read Test */
-		while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
+		while ((s = nd_sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
 			continue; /* Restart if interrupted by handler */
 
+        if (debug) fprintf(debugfile,"Floppy: Read Test\n");
 		if (dev->bufptr>=0 && dev->bufptr<FDD_BUFSIZE) {
 			if (dev->bufptr_msb) {
 				dev->buff[dev->bufptr] = (dev->buff[dev->bufptr] & 0x00ff) | ((dev->test_byte << 8) & 0xff00);
@@ -247,24 +327,26 @@ void Floppy_IO(ushort ioadd) {
 				dev->bufptr = 0;
 		}
 
-		if (sem_post(&sem_io) == -1) { /* release io lock */
+		if (nd_sem_post(&sem_io) == -1) { /* release io lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure Floppy_IO\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
 		break;
 	case 7: /*IOX WSCT - Write Sector/ Write Test Byte */
-		while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
+		while ((s = nd_sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
 			continue; /* Restart if interrupted by handler */
 
 		if (dev->test_mode) {
+            if (debug) fprintf(debugfile, "Floppy: set sector (test): %d\n",dev->sector);
 			dev->test_byte = (gA >>8) & 0xff;
 		} else {
 			dev->sector = (gA >> 8) & 0x7f;
 			dev->sector_autoinc = (gA>>15) &0x01;
+            if (debug) fprintf(debugfile, "Floppy: set sector: %d\n",dev->sector);
 			/*TODO:: check ranges on sector based on floppy type selected */
 		}
 
-		if (sem_post(&sem_io) == -1) { /* release io lock */
+		if (nd_sem_post(&sem_io) == -1) { /* release io lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure Floppy_IO\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
@@ -293,30 +375,181 @@ void Parity_Mem_IO(ushort ioadd) {
 }
 
 /*
- * Read and write from/to floppy
+ * Read and write from/to hard disk
  */
-void HDD_10MB_IO(ushort ioadd) {
-	int reladd = (int)(ioadd & 0x07); /* just get lowest three bits, to work with both disk system I and II */
-	switch(reladd) {
-	case 0: /* Read Memory Address */
-		break;
-	case 1: /* Load Memory Address */
-		break;
-	case 2: /* Read Sector Counter */
-		break;
-	case 3: /* Load Block Address */
-		break;
-	case 4: /* Read Status Register */
-		break;
-	case 5: /* Load Control Word */
-		break;
-	case 6: /* Read Block Address */
-		break;
-	case 7: /* Load Word Counter Register */
-		break;
-	}
-	return;
-}
+void HDD_IO(ushort ioadd) {
+    int s;
+    int a = ioadd & 0x07;
+    struct hdd_data *dev = iodata[ioadd];
+    while ((s = nd_sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
+        continue; /* Restart if interrupted by handler */
+    switch(a) {
+    case 0: /* Read Mem Addr / Word count */
+            if (dev->cwr & 0x8000) {
+                if (!dev->second_word) {
+                    gA = dev->word_count & 0xffff;
+                } else {
+                    gA = (dev->word_count >> 16) & 0xff;
+                }
+                if (debug) fprintf(debugfile,"HDD_IO: IOX 0%o Read Word Count %d A=0x%04x\n",ioadd,dev->word_count,gA);
+            } else {
+                if (!dev->second_word) {
+                    gA = dev->mem_addr & 0xffff;
+                } else {
+                    gA = (dev->mem_addr >> 16) & 0xff;
+                }
+                if (debug) fprintf(debugfile,"HDD_IO: IOX 0%o Read Mem Addr 0x%08x A=0x%04x FF=%d\n",ioadd,dev->mem_addr,gA,dev->second_word);
+            }
+            dev->second_word = !dev->second_word;
+            break;
+    case 1: /* Load Mem Addr / Word count */
+            if (dev->cwr & 0x8000) {
+                dev->word_count = ((dev->word_count << 16) & 0x00ff0000) | gA;
+                if (debug) fprintf(debugfile,"HDD_IO: IOX 0%o Load Word Count 0x%08x 0x%04x\n",ioadd,dev->word_count,gA);
+            } else {
+                dev->mem_addr = ((dev->mem_addr << 16) & 0x00ff0000) | gA;
+                if (debug) fprintf(debugfile,"HDD_IO: IOX 0%o Load Mem Addr 0x%08x 0x%04x\n",ioadd,dev->mem_addr,gA);
+            }
+            dev->second_word = !dev->second_word;
+            break;
+    case 2: /* Read Seek Condition / Read ECC Count */
+            if (dev->cwr & 0x8000) {
+                if (debug) fprintf(debugfile,"HDD_IO: IOX 0%o Read ECC Count\n",ioadd);
+            } else {
+                ushort acc = 0;
+                // Bits 0..3 Seek complete: toggles every revolution
+                acc |= 0x0;
+                // 4 ..7 not used
+                // 8..9 Unit select
+                acc |= (dev->unit_select & 0x03) << 8;
+                // 11 Seek error
+                // 12 always 1
+                acc |= (1<<12);
+                // 13 ECC correctable
+                // 14 ECC parity error
+                // 15 Error in Adress Field
+                gA = acc;
+                if (debug) fprintf(debugfile,"HDD_IO: IOX 0%o Read Seek Cond. A=0x%04x\n",ioadd,acc);
+            }
+            break;
+    case 3: /* Load Block Address I / Load Block Address II */
+            if (dev->cwr & 0x8000) {
+                dev->track = gA;
+                if (debug) fprintf(debugfile,"HDD_IO: IOX 0%o Load Block Addr II track=%d\n",ioadd,dev->track);
+            } else {
+                // new:
+                dev->sector = gA & 0xff;
+                dev->surface = ((gA >> 8) & 0xff);
+                // old 10MB:
+                //dev->sector = gA & 0x1F;
+                //dev->surface = (((gA >> 14) | (gA >> 5)) & 0x03) ^ 2;
+                //dev->track = (gA >> 6) & 0x1FF;
+                if (debug) fprintf(debugfile,"HDD_IO: IOX 0%o Load Block Addr I A=0x%04x sect=%d surf=%d cyl=%d\n",ioadd,gA,dev->sector,dev->surface, dev->track);
+            }
+            break;
+    case 4: /* Read Status / Read ECC Pattern */
+            if (dev->cwr & 0x8000) {
+                ushort acc = 0xF800;
+                gA = acc;
+                if (debug) fprintf(debugfile,"HDD_IO: IOX 0%o Read ECC Pattern 0x%04x\n",ioadd,acc);
+            } else {
+                dev->second_word = false;
+                ushort acc = 0;
+                acc |= dev->irq_en ? 1 : 0;       // Bit 0 IRQ Enabled
+                acc |= dev->err_irq_en ? (1<<1) : 0;
+                acc |= dev->active ? (1<<2) : 0;
+                acc |= dev->finished ? (1<<3) : 0;
+                bool error = dev->err_hw || dev->err_data || dev->err_compare || dev->err_timeout 
+                    || dev->err_abnormal || dev->err_ill_load || dev->err_disk_unit || dev->err_dma_channel || dev->err_addr_mismatch;
+                acc |= error ? (1<<4) : 0;
+                acc |= dev->err_ill_load ? (1<<5) : 0;
+                acc |= dev->err_timeout ? (1<<6) : 0;
+                acc |= dev->err_hw ? (1<<7) : 0;
+                acc |= dev->err_addr_mismatch ? (1<<8) : 0;
+                acc |= dev->err_data ? (1<<9) : 0;
+                acc |= dev->err_compare ? (1<<10) : 0;
+                acc |= dev->err_dma_channel ? (1<<11) : 0;
+                acc |= dev->err_abnormal ? (1<<12) : 0;
+                acc |= dev->err_disk_unit ? (1<<13) : 0;
+                acc |= dev->on_cylinder ? (1<<14) : 0;
+                gA = acc;
+                if (debug) fprintf(debugfile,"HDD_IO: IOX 0%o Read Status 0x%04x\n",ioadd,acc);
+            }
+            break;
+        case 5: /* Write Control Word WCWD */ {
+            char *opname = "??";
+            ushort acc = gA;
+            if (acc & (1<<4)) { /* Device clear */
+                hdd_dev_clear(dev);
+                dev->on_cylinder = true;
+                dev->finished = true;
+                dev->active = false;
+            }
+            dev->cwr = acc;
+            // Old HAWK drive: Bit 5 => Bit 16 memory address Bit 6 => Bit 17 memory address
+            dev->unit_select = (acc & 0x180) >> 7;
+            dev->opcode = (acc & 0x7800) >> 11;
+            dev->active = (acc & (1<<2)) != 0;
+            dev->irq_en = (acc & 1) != 0;
+            // bit 3: test mode
+            // bit 4: clear
+            switch (dev->opcode) {
+                case 0: opname = "ReadTransfer"; break;
+                case 1: opname = "WriteTransfer"; break;
+                case 2: opname = "ReadParity"; break;
+                case 3: opname = "Compare"; break;
+                case 4: opname = "InitiateSeek"; break;
+                case 5: opname = "WriteFormat"; break;
+                case 6: opname = "SeekComplete"; break;
+                case 7: opname = "ReturnToZeroSeek"; break;
+                case 8: opname = "RunECC"; break;
+                case 9: opname = "SelectRelease"; break;
+            }
+            if (dev->active) {
+                if (debug) fprintf(debugfile,"HDD_IO: IOX 0%o Write control word 0x%04x, unit=%d, opcode=%d, %s, active=%d\n",ioadd,acc,dev->unit_select, dev->opcode, opname, dev->active);
+            } else {
+                if (debug) fprintf(debugfile,"HDD_IO: IOX 0%o Write control word 0x%04x, unit=%d\n",ioadd,acc,dev->unit_select);
+            }
+            if (dev->active && dev->finished) {
+                dev->finished = false;
+                /* TRIGGER HDD THREAD */
+                if (nd_sem_post(&sem_hdd) == -1) { /* release hdd lock */
+                    if (debug) fprintf(debugfile,"ERROR!!! sem_hdd failure HDD_IO\n");
+                    CurrentCPURunMode = SHUTDOWN;
+                }
+            }
+            break; }
+    case 6: /* Read Block Address I / Read Block Address II */
+            if (dev->cwr & 0x8000) {
+                gA = dev->track;
+                if (debug) fprintf(debugfile,"HDD_IO: IOX 0%o Read Block Addr II track=%d A=0x%04x\n",ioadd,dev->track,gA);
+            } else {
+                gA = (dev->sector & 0xff) | ((dev->surface << 8) & 0xff00);
+                if (debug) fprintf(debugfile,"HDD_IO: IOX 0%o Read Block Addr I sect=%d surf=%d A=0x%04x\n",ioadd,dev->sector,dev->surface,gA);
+            }
+            break;
+        case 7: /* Load Word Count / Load ECC Control */
+                if (dev->cwr & 0x8000) {
+                    if (debug) fprintf(debugfile,"HDD_IO: IOX 0%o Load ECC control A=0x%04x\n",ioadd,gA);
+                } else {
+                    if (dev->second_word) {
+                        dev->word_count = (dev->word_count & 0xffff) | ((gA << 16) & 0xff0000);
+                    } else {
+                        dev->word_count = (dev->word_count & 0xff0000) | gA;
+                    }
+                    // Not on 10MB disk: dev->second_word = !dev->second_word;
+                    dev->second_word = !dev->second_word;
+                    if (debug) fprintf(debugfile,"HDD_IO: IOX 0%o Load Word Count %d A=0x%04x\n",ioadd,dev->word_count,gA);
+                }
+                break;
+
+    }
+    if (debug) fflush(debugfile);
+    if (nd_sem_post(&sem_io) == -1) { /* release io lock */
+        if (debug) fprintf(debugfile,"ERROR!!! sem_post failure HDD_IO\n");
+        CurrentCPURunMode = SHUTDOWN;
+    }
+} /* HDD IO */
 
 /*
  * mopc function to scan for an available char
@@ -337,7 +570,7 @@ int mopc_in(char *chptr) {
 	cp = tty_arr[0]->rcv_cp;
 	pp = tty_arr[0]->rcv_fp;
 	status = tty_arr[0]->in_status;
-	if (sem_post(&sem_io) == -1) { /* release io lock */
+	if (nd_sem_post(&sem_io) == -1) { /* release io lock */
 		if (debug) fprintf(debugfile,"ERROR!!! sem_post failure mopc_in\n");
 		CurrentCPURunMode = SHUTDOWN;
 	}
@@ -349,7 +582,7 @@ int mopc_in(char *chptr) {
 	if (debug) fflush(debugfile);
 
 	if (pp != cp) {	/* ok we have some data here */
-		while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
+		while ((s = nd_sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
 			continue; /* Restart if interrupted by handler */
 		ptr = tty_arr[0]->rcv_cp;
 		*chptr =  (tty_arr[0]->rcv_arr[ptr] & 0x7f);
@@ -357,7 +590,7 @@ int mopc_in(char *chptr) {
 		if (tty_arr[0]->rcv_fp == tty_arr[0]->rcv_cp) {
 			tty_arr[0]->in_status &= ~0x0008;	/* Bit 3=0 device not ready for transfer */
 		}
-		if (sem_post(&sem_io) == -1) { /* release io lock */
+		if (nd_sem_post(&sem_io) == -1) { /* release io lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure mopc_in\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
@@ -384,23 +617,31 @@ void mopc_out(char ch) {
 	if (debug) fflush(debugfile);
 
 	if(tty_arr[0]){ /* array exists so we can work with this now */
-		while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
+		while ((s = nd_sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
 			continue; /* Restart if interrupted by handler */
 		ptr=tty_arr[0]->snd_fp;
 		tty_arr[0]->snd_arr[ptr]= ch;
 		tty_arr[0]->snd_fp++;
-		if (sem_post(&sem_io) == -1) { /* release io lock */
+		if (nd_sem_post(&sem_io) == -1) { /* release io lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure mopc_out\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
 
-		if (sem_post(&sem_cons) == -1) { /* release console lock */
+		if (nd_sem_post(&sem_cons) == -1) { /* release console lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure mopc_out\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
 	}
 }
 
+static void slowDown(void)
+{
+    static double last = 0;
+    if (instr_counter > last + 20) {
+        last = instr_counter;
+        usleep(1000);
+    }
+}
 
 /*
  * Read and write to system console
@@ -408,18 +649,18 @@ void mopc_out(char ch) {
 void Console_IO(ushort ioadd) {
 	int s;
 	unsigned char ptr; /* ringbuffer pointer */
+    while ((s = nd_sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
+        continue; /* Restart if interrupted by handler */
 	switch(ioadd) {
 	case 0300: /* Read input data */
 		if (!tty_arr[0]){ /* tty structure not created yet... return zero(safety function) */
 			gA=0;
-			return;
+			break;
 		}
 		if (MODE_OPCOM) { /* mopc has authority */
-			return;
+			break;
 		}
 		if(tty_arr[0]) { /* array exists so we can work with this now */
-			while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
-				continue; /* Restart if interrupted by handler */
 			if (tty_arr[0]->rcv_fp != tty_arr[0]->rcv_cp) { /* ok we have some data here */
 				ptr = tty_arr[0]->rcv_cp;
 				gA =  (tty_arr[0]->rcv_arr[ptr] & 0x00ff);
@@ -430,10 +671,6 @@ void Console_IO(ushort ioadd) {
 			} else {
 				gA=0;
 			}
-			if (sem_post(&sem_io) == -1) { /* release io lock */
-				if (debug) fprintf(debugfile,"ERROR!!! sem_post failure Console_IO\n");
-				CurrentCPURunMode = SHUTDOWN;
-			}
 		}
 		break;
 	case 0301: /* NOOP*/
@@ -441,39 +678,22 @@ void Console_IO(ushort ioadd) {
 	case 0302: /* Read input status */
 		if (!tty_arr[0]){ /* tty structure not created yet... return zero (safety function) */
 			gA=0;
-			return;
+			break;
 		}
 		if (MODE_OPCOM) { /* mopc has authority */
-			while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
-				continue; /* Restart if interrupted by handler */
 			gA =tty_arr[0]->in_status & ~0x00008;	/* Bit 3=0 device not ready for transfer */
-			if (sem_post(&sem_io) == -1) { /* release io lock */
-				if (debug) fprintf(debugfile,"ERROR!!! sem_post failure Console_IO\n");
-				CurrentCPURunMode = SHUTDOWN;
-			}
-			return;
+			break;
 		}
-		while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
-			continue; /* Restart if interrupted by handler */
-		gA =tty_arr[0]->in_status;
-			if (sem_post(&sem_io) == -1) { /* release io lock */
-				if (debug) fprintf(debugfile,"ERROR!!! sem_post failure Console_IO\n");
-				CurrentCPURunMode = SHUTDOWN;
-			}
+        gA =tty_arr[0]->in_status;
+        slowDown();
 		break;
 	case 0303: /* Set input control */
 		if (!tty_arr[0]) return; /* tty structure not created yet... return zero (safety function) */
-		while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
-			continue; /* Restart if interrupted by handler */
 		tty_arr[0]->in_control = gA; /* sets control reg all flags */
 		if (gA & 0x0004) {	/* activate device */
 			tty_arr[0]->in_status |= 0x0004;
 		} else {		/* deactivate device */
 			tty_arr[0]->in_status &= ~0x0004;
-		}
-		if (sem_post(&sem_io) == -1) { /* release io lock */
-			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure Console_IO\n");
-			CurrentCPURunMode = SHUTDOWN;
 		}
 		break;
 	case 0304: /* Returns 0 in A */
@@ -481,17 +701,12 @@ void Console_IO(ushort ioadd) {
 		break;
 	case 0305: /* Write data */
 		if(tty_arr[0]){ /* array exists so we can work with this now */
-			while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
-				continue; /* Restart if interrupted by handler */
+            ushort ch = gA & 0x007F;
 			ptr=tty_arr[0]->snd_fp;
-			tty_arr[0]->snd_arr[ptr]=gA & 0x007F;
+			tty_arr[0]->snd_arr[ptr] = ch;
 			tty_arr[0]->snd_fp++;
-			if (sem_post(&sem_io) == -1) { /* release io lock */
-				if (debug) fprintf(debugfile,"ERROR!!! sem_post failure Console_IO\n");
-				CurrentCPURunMode = SHUTDOWN;
-			}
-
-			if (sem_post(&sem_cons) == -1) { /* release console lock */
+            if (debug) fprintf(debugfile,"Console: 0x%02X (%c)\n",ch,ch);
+			if (nd_sem_post(&sem_cons) == -1) { /* release console lock */
 				if (debug) fprintf(debugfile,"ERROR!!! sem_post failure Console_IO\n");
 				CurrentCPURunMode = SHUTDOWN;
 			}
@@ -500,20 +715,20 @@ void Console_IO(ushort ioadd) {
 	case 0306: /* Read output status */
 		if (!tty_arr[0]){ /* tty structure not created yet... return zero (safety function) */
 			gA=0;
-			return;
+			break;
 		}
-		while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
-			continue; /* Restart if interrupted by handler */
-		gA=tty_arr[0]->out_status;
-		if (sem_post(&sem_io) == -1) { /* release io lock */
-			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure Console_IO\n");
-			CurrentCPURunMode = SHUTDOWN;
-		}
+		gA = tty_arr[0]->out_status;
+        tty_arr[0]->out_status &= 0xFFFE; // Clear IRQ bit
 		break;
 	case 0307: /* Set output control */
-		if (!tty_arr[0]) return; /* tty structure not created yet... return zero (safety function) */
+		if (!tty_arr[0]) break; /* tty structure not created yet... return zero (safety function) */
+        tty_arr[0]->out_control = gA;
 		break;
 	}
+    if (nd_sem_post(&sem_io) == -1) { /* release io lock */
+            if (debug) fprintf(debugfile,"ERROR!!! sem_post failure Console_IO\n");
+            CurrentCPURunMode = SHUTDOWN;
+    }
 }
 
 void IO_Handler_Add(int startdev, int stopdev, void *funcpointer, void *datapointer) {
@@ -530,9 +745,20 @@ void IO_Data_Add(int startdev, int stopdev,  void * datastructptr) {
 	return;
 }
 
+static
+void hdd_init(void)
+{
+    struct hdd_data * dev;
+    
+    dev =calloc(1,sizeof(struct hdd_data));
+    IO_Data_Add(01540,01547,dev);
+    
+    dev =calloc(1,sizeof(struct hdd_data));
+    IO_Data_Add(0500,0507,dev);
+}
 
 /* Add IO handler addresses in this function */
-void Setup_IO_Handlers () {
+void Setup_IO_Handlers (void) {
 	int i;
 
 	/* to be removed, and changed to new structure */
@@ -546,8 +772,10 @@ void Setup_IO_Handlers () {
 	IO_Handler_Add(8,11,&RTC_IO,NULL);			/* CPU RTC 10-13 octal */
 	IO_Handler_Add(192,199,&Console_IO,NULL);		/* Console terminal 300-307 octal */
 	IO_Handler_Add(880,887,&Floppy_IO,NULL);		/* Floppy Disk 1 at 1560-1567 octal */
-	floppy_init();
-//	IO_Handler_Add(320,327,&HDD_10MB_IO,NULL);		/* Disk System I at 500-507 octal */
+    floppy_init();
+    IO_Handler_Add(01540,01547,&HDD_IO,NULL);        /* Hard Disk 1 at 1540-1547 octal */
+    // 10MB IO_Handler_Add(0500,0507,&HDD_IO,NULL);        /* Hard Disk 1 at 1540-1547 octal */
+    hdd_init();
 }
 
 /*
@@ -555,7 +783,7 @@ void Setup_IO_Handlers () {
  * NOTE: Not sure if this is the best way, but needed to start somewhere. Might be a totally different solution in the end.
  *
  */
-void floppy_init() {
+void floppy_init(void) {
 	struct floppy_data * ptr;
 	struct fdd_unit * ptr2;
 
@@ -583,8 +811,14 @@ void floppy_init() {
 			ptr->unit[2] = ptr2;
 		}
 	}
-	ptr->selected_drive = -1;	/* no drive selected at start */
+	ptr->selected_drive = 0;	/* no drive selected at start */
+    ptr->sector = 1;
 	IO_Data_Add(880,887,ptr);
+}
+
+void
+select_floppy(int which) {
+    diskNumber = which;
 }
 
 /*
@@ -632,13 +866,22 @@ void do_listen(int port, int numconn, int * sock) {
 	}
 }
 
-void console_stdio_in() {
+void
+dump_mem(char *filename) {
+    FILE *memfile = fopen(filename,"w+");
+    if (memfile != NULL) {
+        fwrite(&VolatileMemory,1,sizeof(VolatileMemory),memfile);
+        fclose(memfile);
+    }
+}
+
+void console_stdio_in(void) {
 	int s;
 	char ch,parity;
 	char recv_data[1024];
-	int numbytes;
+	long int numbytes;
 	unsigned char pp,cp,tmp,cnt,cnt2;
-	int numread;
+	long int numread = 0;
 	ushort status,control;
 	fd_set rfds;
 	int retval;
@@ -654,21 +897,27 @@ void console_stdio_in() {
 
 	while(CurrentCPURunMode != SHUTDOWN) {
 
-		while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
+		while ((s = nd_sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
 			continue; /* Restart if interrupted by handler */
 		status = tty_arr[0]->in_status;
 		control = tty_arr[0]->in_control;
-		if (sem_post(&sem_io) == -1) { /* release io lock */
+		if (nd_sem_post(&sem_io) == -1) { /* release io lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure console_stdio_in\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
-
-		if (status & 0x0004) { /* Bit 2=1 device is active */
-			while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
+        if (status & 0x0008) {
+            usleep(100000);
+            if (control & 1) {
+                tty_arr[0]->in_status |= 1;
+                genIRQ(12,1,CONSOLE_IN_ID);
+            }
+        }
+		if ((status & 0x0004) && !(status & 0x0008)) { /* Bit 2=1 device is active */
+			while ((s = nd_sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
 				continue; /* Restart if interrupted by handler */
 			pp=tty_arr[0]->rcv_fp;
 			cp=tty_arr[0]->rcv_cp;
-			if (sem_post(&sem_io) == -1) { /* release io lock */
+			if (nd_sem_post(&sem_io) == -1) { /* release io lock */
 				if (debug) fprintf(debugfile,"ERROR!!! sem_post failure console_stdio_in\n");
 				CurrentCPURunMode = SHUTDOWN;
 			}
@@ -676,11 +925,39 @@ void console_stdio_in() {
 			/* this gets us max buffer size we can use */
 			numbytes = (cp < pp) ? 256-pp+cp-2 : (pp < cp) ? cp-pp-2 : 254;
 			numbytes = ( numbytes > 0) ? numbytes : 0;
-
-			retval = select(1, &rfds, NULL, NULL, NULL);
-
-			/* ok lets send what we got... */
-			numread = read (0, recv_data, numbytes);
+            if ((*script_console_in_ptr)) {
+                while ((*script_console_in_ptr)) {
+                    char ch = *script_console_in_ptr++;
+                    if (ch == '\t') {
+                        char ch2 = *script_console_in_ptr++;
+                        if (ch2 >= '0' && ch2 <= '9') {
+                            select_floppy(ch2 - '0');
+                        }
+                    } else {
+                        if (ch == '!') {
+                            dump_mem("mem_01.dump");
+                            //trace_open();
+                            //trace = 15;
+                        }
+                        *recv_data = ch;
+                        numread = 1;
+                        retval = 1;
+                        break;
+                    }
+                }
+            } else {
+                do {
+                    retval = select(1, &rfds, NULL, NULL, NULL);
+                    
+                    /* ok lets send what we got... */
+                    numread = read (0, recv_data, numbytes);
+                    if (numbytes == 1 && recv_data[0] == 25) { // CTRL-Y saves CPU State
+                        cpu_savestate();
+                    } else {
+                        break;
+                    }
+                } while (true);
+            }
 			tmp = numread;
 			if (numread > 0) {
 				tmp = numread;
@@ -704,26 +981,28 @@ void console_stdio_in() {
 						ch &= 0x1f;
 						break;
 					}
-					if(control & 0x4000) {	/* Bit 14=1 even parity is used */
+                    if(1) { /*control & 0x4000) {	/* Bit 14=1 even parity is used */
 						/* set parity to 0 for even parity or 1 for odd parity  */
 						parity=0;
 						for (cnt2 = 0; cnt2 < 8; cnt2++)
 							parity ^= ((ch >> cnt2) & 1);
 						ch = (parity) ? ch | 0x80 : ch;
-					}
+                        if (debug) fprintf (debugfile,"(##) ch=%i (%c) parity=%i statusreg(bits)=%d\n",ch,ch,parity,(int)((control & 0x1800)>>11));
+                    } else {
+                        if (debug) fprintf (debugfile,"(##) ch=%i (%c) NO parity=%i statusreg(bits)=%d\n",ch,ch,parity,(int)((control & 0x1800)>>11));
+                    }
 
-					if (debug) fprintf (debugfile,"(##) ch=%i (%c) parity=%i statusreg(bits)=%d\n",ch,ch,parity,(int)((control & 0x1800)>>11));
 					if (debug) fflush(debugfile);
 
 //					if (ch == 10) { /* lf?? */
 //						cnt++;
 //					} else {
-						while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
+						while ((s = nd_sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
 							continue; /* Restart if interrupted by handler */
 						pp=tty_arr[0]->rcv_fp;
 						tty_arr[0]->rcv_arr[pp]=ch;
 						tty_arr[0]->rcv_fp++;
-						if (sem_post(&sem_io) == -1) { /* release io lock */
+						if (nd_sem_post(&sem_io) == -1) { /* release io lock */
 							if (debug) fprintf(debugfile,"ERROR!!! sem_post failure console_stdio_in\n");
 							CurrentCPURunMode = SHUTDOWN;
 						}
@@ -732,10 +1011,10 @@ void console_stdio_in() {
 						pp++;
 //					}
 				}
-				while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
+				while ((s = nd_sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
 					continue; /* Restart if interrupted by handler */
 				tty_arr[0]->in_status |= 0x0008;	/* Bit 3=1 device ready for transfer */
-				if (sem_post(&sem_io) == -1) { /* release io lock */
+				if (nd_sem_post(&sem_io) == -1) { /* release io lock */
 					if (debug) fprintf(debugfile,"ERROR!!! sem_post failure console_stdio_in\n");
 					CurrentCPURunMode = SHUTDOWN;
 				}
@@ -744,10 +1023,9 @@ void console_stdio_in() {
 	}
 }
 
-void console_stdio_thread() {
+void console_stdio_thread(void) {
 	int s;
 //	char ch;
-	int numbytes;
 	unsigned char pp,cp,tmp;
 
 	struct ThreadChain *tc_elem;
@@ -765,28 +1043,26 @@ void console_stdio_thread() {
 	while(CurrentCPURunMode != SHUTDOWN) {
 		tty_arr[0]->out_status |= 0x0008; /* Bit 3=1 ready for transfer */
 		while(CurrentCPURunMode != SHUTDOWN) {
-			while ((s = sem_wait(&sem_cons)) == -1 && errno == EINTR) /* wait for console lock to be free */
+			while ((s = nd_sem_wait(&sem_cons)) == -1 && errno == EINTR) /* wait for console lock to be free */
 				continue; /* Restart if interrupted by handler */
 
 			/* ok lets send what we got... */
 			pp=tty_arr[0]->snd_fp;
 			cp=tty_arr[0]->snd_cp;
-			numbytes=0;
-			if (cp != pp) {
-				numbytes= (cp < pp) ? pp-cp : 256-cp+pp;
-				for(tmp=0;tmp<numbytes;tmp++) {
-					printf("%c",tty_arr[0]->snd_arr[cp]);
-//					switch (ch) {
-//					case 12:
-//						break;
-//					default:
-//						printf("%c",tty_arr[0]->snd_arr[cp]);
-//						break;
-//					}
-					cp++;
-				}
-				tty_arr[0]->snd_cp=cp;
-			}
+            if (cp != pp) {
+                while (cp != pp) {
+                    printf("%c",tty_arr[0]->snd_arr[cp]);
+                    cp++;
+                }
+                tty_arr[0]->snd_cp=cp;
+            }
+            if (cp == pp && (tty_arr[0]->out_control & 1)) {
+                usleep(10000);
+                if ((tty_arr[0]->out_control & 1) && !(tty_arr[0]->out_status & 1)) {
+                    tty_arr[0]->out_status |= 1;
+                    genIRQ(10,1,CONSOLE_OUT_ID);
+                }
+            }
 		}
 	}
 	return;
@@ -816,20 +1092,20 @@ void console_socket_in(int *connected) {
 	FD_SET(*connected, &rfds);
 
 	while(CurrentCPURunMode != SHUTDOWN) {
-		while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
+		while ((s = nd_sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
 			continue; /* Restart if interrupted by handler */
 		status = tty_arr[0]->in_status;
 		control = tty_arr[0]->in_control;
-		if (sem_post(&sem_io) == -1) { /* release io lock */
+		if (nd_sem_post(&sem_io) == -1) { /* release io lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure console_stdio_in\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
 		if (status & 0x0004) { /* Bit 2=1 device is active */
-			while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
+			while ((s = nd_sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
 				continue; /* Restart if interrupted by handler */
 			pp=tty_arr[0]->rcv_fp;
 			cp=tty_arr[0]->rcv_cp;
-			if (sem_post(&sem_io) == -1) { /* release io lock */
+			if (nd_sem_post(&sem_io) == -1) { /* release io lock */
 				if (debug) fprintf(debugfile,"ERROR!!! sem_post failure console_stdio_in\n");
 				CurrentCPURunMode = SHUTDOWN;
 			}
@@ -858,7 +1134,7 @@ void console_socket_in(int *connected) {
 						if (debug) fflush(debugfile);
 //						ch = (ch == 10) ? 13 : ch; /* change lf to cr */
 						ch &= 0x7f;	/* trim to 7 bit ASCII  FIXME:: This should depend on bits 11-12 in control reg*/
-						if(tty_arr[0]->in_control && 0x4000){	/* Bit 14=1 even parity is used */
+						if(tty_arr[0]->in_control & 0x4000){	/* Bit 14=1 even parity is used */
 							/* set parity to 0 for even parity or 1 for odd parity  */
 							parity=0;
 							for (cnt2 = 0; cnt2 < 8; cnt2++)
@@ -883,7 +1159,7 @@ void console_socket_in(int *connected) {
 	}
 }
 
-void console_socket_thread() {
+void console_socket_thread(void) {
 	int s;
 	int sock, connected;
 	char send_data [1024];
@@ -901,8 +1177,8 @@ void console_socket_thread() {
 	if (debug) fflush(debugfile);
 	tty_arr[0] = calloc(1,sizeof(struct tty_io_data));
 
-	do_listen(5001, 1, &sock);
-	if (debug) fprintf(debugfile,"\n(#)TCPServer Waiting for client on port 5001\n");
+	do_listen(5101, 1, &sock);
+	if (debug) fprintf(debugfile,"\n(#)TCPServer Waiting for client on port 5101\n");
 	if (debug) fflush(debugfile);
 
 	while(CurrentCPURunMode != SHUTDOWN) {
@@ -923,7 +1199,7 @@ void console_socket_thread() {
 
 		tty_arr[0]->out_status |= 0x0008; /* Bit 3=1 ready for transfer */
 		while(CurrentCPURunMode != SHUTDOWN) {
-			while ((s = sem_wait(&sem_cons)) == -1 && errno == EINTR) /* wait for console lock to be free */
+			while ((s = nd_sem_wait(&sem_cons)) == -1 && errno == EINTR) /* wait for console lock to be free */
 				continue; /* Restart if interrupted by handler */
 
 			/* ok lets send what we got... */
@@ -954,43 +1230,183 @@ Floppy_IO: IOX 883 - A=2
 Floppy_IO: IOX 882 - A=10831
 Floppy_IO: IOX 882 - A=2
 */
-void floppy_thread(){
+void floppy_thread(void){
 	int s;
 	struct floppy_data *dev;
-
+    struct fdd_unit *unit = NULL;
+    
 	while(CurrentCPURunMode != SHUTDOWN) {
-		while ((s = sem_wait(&sem_floppy)) == -1 && errno == EINTR) /* wait for floppu lock to be free and take it */
+		while ((s = nd_sem_wait(&sem_floppy)) == -1 && errno == EINTR) /* wait for floppu lock to be free and take it */
 			continue; /* Restart if interrupted by handler */
+        usleep(100);
 		/* Do our stuff now and then return and wait for next freeing of lock. */
 		dev = iodata[880];	/*TODO:: This is just a temporary solution!!! */
+        if(dev->selected_drive != -1) {
+            unit = dev->unit[dev->selected_drive];
+        }
 
-		while ((s = sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
+		while ((s = nd_sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
 			continue; /* Restart if interrupted by handler */
 
-		if (dev->busy) {
-			if(dev->command == 1) { 		/* CONTROL RESET */
-			} else if (dev->command == 1) {		/* RECALIBRATE */
+		if (dev->busy) { /* command is upper 8 bit of written IOX call */
+			if(dev->command & (1<<7)) { 		    /* 128: CONTROL RESET */
+                dev->busy = false;
+			} else if (dev->command & (1<<6)) {		/* 64: RECALIBRATE */
+                dev->track = 0;
+                dev->seekComplete = true;
+                dev->busy = false;
 				/* track = 0, interrupt!, set status seek complete */
-			} else if (dev->command == 1) {		/* SEEK */
+			} else if (dev->command & (1<<5)) {		/* 32: SEEK */
+                int oldTrack = dev->track;
+                if (unit != NULL) {
+                    if (unit->dir_track == 1) {
+                        dev->track += unit->diff_track;
+                        if (dev->track > 77) dev->track = 77;
+                    } else {
+                        dev->track -= unit->diff_track;
+                        if (dev->track < 0) dev->track = 0;
+                    }
+                    if(debug) fprintf(debugfile, "Floppy: seek from %d to %d\n",oldTrack,dev->track);
+                } else {
+                    if(debug) fprintf(debugfile, "Floppy: seek unit==NULL\n");
+                }
+                dev->seekComplete = true;
+                dev->busy = false;
 				/* track = nn, interrupt!, set status seek complete */
-			} else if (dev->command == 1) {		/* READ ID */
-			} else if (dev->command == 1) {		/* READ DATA */
-			} else if (dev->command == 1) {		/* WRITE DATA */
-			} else if (dev->command == 1) {		/* WRITE DELETED DATA */
-			} else if (dev->command == 1) {		/* FORMAT TRACK */
+			} else if (dev->command & (1<<3)) {		/* 8: READ ID: Track 0 Sector 2 */
+                if (debug) fprintf(debugfile, "Floppy: read ID Track=%d, Sector=%d\n",dev->track,dev->sector);
+                dev->buff[0] = dev->track << 8 ;
+                dev->buff[1] = (dev->sector << 8) | 0x02;       // Low byte = 0x2
+                dev->rwComplete = true;
+                dev->busy = false;
+			} else if (dev->command & (1<<4)) {		/* 16: READ DATA */
+                if (debug) fprintf(debugfile,"Floppy: read DATA Track=%d, Sector=%d Buf=%d\n",dev->track,dev->sector,dev->bufptr_read);
+                int xsector = dev->sector -1;
+                if (xsector < 0) xsector = 0;
+                sectorread (diskNumber, dev->track, 0, xsector, &dev->buff[dev->bufptr_read]);
+                dev->bufptr_read = ( dev->bufptr_read + 256 ) % FDD_BUFSIZE;
+                dev->rwComplete = true;
+                dev->busy = false;
+			} else if ((dev->command & (1<<2)) || (dev->command & (1<<1))) {		/* 4: WRITE DATA */
+                if (debug) fprintf(debugfile,"Floppy: write DATA Track=%d, Sector=%d Buf=%d\n",dev->track,dev->sector,dev->bufptr_read);
+                int xsector = dev->sector -1;
+                if (xsector < 0) xsector = 0;
+                sectorwrite (diskNumber, dev->track, 0, xsector, &dev->buff[dev->bufptr_read]);
+                dev->bufptr_read = ( dev->bufptr_read + 256 ) % FDD_BUFSIZE;
+                dev->rwComplete = true;
+                dev->busy = false;
+			} else if (dev->command & (1<<0)) {		/* 1: FORMAT TRACK */
+                dev->busy = false;
 			}
+            if (!dev->busy) {
+                if (dev->irq_en) {
+                    genIRQ(11,021,FLOPPY_ID);
+                }
+                if (nd_sem_post(&sem_floppy) == -1) { /* release io lock */
+                    if (debug) fprintf(debugfile,"ERROR!!! sem_post failure Floppy_IO\n");
+                    CurrentCPURunMode = SHUTDOWN;
+                }
+            }
 		}
-
-		if (sem_post(&sem_io) == -1) { /* release io lock */
+		if (nd_sem_post(&sem_io) == -1) { /* release io lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure Floppy_IO\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
 	}
 }
+extern _NDRAM_        VolatileMemory;
 
-void panel_thread() {
+/*
+Disk_IO: IOX 1540
+*/
+void hdd_thread(void){
+    int s;
+    struct hdd_data *dev;
+    
+    while(CurrentCPURunMode != SHUTDOWN) {
+        while ((s = nd_sem_wait(&sem_hdd)) == -1 && errno == EINTR) /* wait for hdd lock to be free and take it */
+            continue; /* Restart if interrupted by handler */
+        usleep(5000);
+        /* Do our stuff now and then return and wait for next freeing of lock. */
+        dev = iodata[01540];    /*TODO:: This is just a temporary solution!!! */
+
+        while ((s = nd_sem_wait(&sem_io)) == -1 && errno == EINTR) /* wait for io lock to be free and take it */
+            continue; /* Restart if interrupted by handler */
+        if (dev->active) {
+            int hdd_file = open("hdd.img",O_RDWR|O_CREAT);
+            // 10MB long logical = (dev->sector | (dev->track << 5) | (dev->surface << 14)) & 0xffff;
+            long numSect = 18;
+            long numSurf = 5;
+            long numTrack = 823; // 75MB
+            long logical = (dev->sector) + (dev->surface * numSect) + (dev->track * numSect * numSurf); // 75MB
+            logical *= 1024;
+            int bytesToRead = 2*dev->word_count;
+            ushort *addr = &VolatileMemory.n_Array[dev->mem_addr];
+            off_t seekFail = lseek(hdd_file, logical, SEEK_SET);
+            if (seekFail >= 0) {
+                size_t result = 0;
+                switch (dev->opcode) {
+                    case 0: // Read Transfer
+                        result = read(hdd_file, addr, bytesToRead);
+                        if (debug) {
+                            fprintf(debugfile,"HDD_IO: read at 0x%lx -> 0%o %ld, errno=%d\n",logical,dev->mem_addr,result,errno);
+                        }
+                        dev->mem_addr += dev->word_count;
+                        break;
+                    case 1: // Write Transfer
+                        result = write(hdd_file, addr, bytesToRead);
+                        if (debug) {
+                            fprintf(debugfile,"HDD_IO: write from 0%o -> 0x%lx %ld, errno=%d\n",dev->mem_addr,logical,result,errno);
+                        }
+                        dev->mem_addr += dev->word_count;
+                        break;
+                    case 2: // Read Parity
+                        break;
+                    case 3: // Compare Test
+                        
+                        break;
+                    case 4: // Initiate Seek
+                        
+                        break;
+                    case 5: // Write Format
+                        
+                        break;
+                    case 6: // Seek complete search
+                        
+                        break;
+                    case 7: // Seek to zero
+                        
+                        break;
+                    default: if (debug) fprintf(debugfile,"HDD_IO: Invalid opcode: %d\n",dev->opcode);
+                        break;
+                }
+            } else {
+                if (debug) fprintf(debugfile,"HDD_IO: SEEK FAILED result %lld, errno=%d\n",seekFail,errno);
+            }
+            close(hdd_file);
+            dev->active = false;
+            dev->finished = true;
+            if (!dev->active) {
+                if (dev->irq_en) {
+                    genIRQ(11,017,HDD_IRQ_ID);
+                }
+                if (nd_sem_post(&sem_hdd) == -1) { /* release io lock */
+                    if (debug) fprintf(debugfile,"ERROR!!! sem_post failure HDD_IO\n");
+                    CurrentCPURunMode = SHUTDOWN;
+                }
+            }
+        }
+        if (nd_sem_post(&sem_io) == -1) { /* release io lock */
+            if (debug) fprintf(debugfile,"ERROR!!! sem_post failure Floppy_IO\n");
+            CurrentCPURunMode = SHUTDOWN;
+        }
+    }
+}
+
+void panel_thread(void) {
 	int s;
-	int sock, connected, bytes_recieved;
+    int sock, connected;
+    long int bytes_recieved;
 	char recv_data[1024];
 	struct sockaddr_in client_addr;
 	socklen_t sin_size;
@@ -998,8 +1414,8 @@ void panel_thread() {
 	if (debug) fprintf(debugfile,"(#)panel_thread running...\n");
 	if (debug) fflush(debugfile);
 
-	do_listen(5000, 1, &sock);
-	if (debug) fprintf(debugfile,"\n(#)TCPServer Waiting for client on port 5000\n");
+	do_listen(5100, 1, &sock);
+	if (debug) fprintf(debugfile,"\n(#)TCPServer Waiting for client on port 5100\n");
 	if (debug) fflush(debugfile);
 
 	while(CurrentCPURunMode != SHUTDOWN) {
@@ -1021,10 +1437,10 @@ void panel_thread() {
 				/* TODO:: this should be in a separate routine DoMCL later */
 				CurrentCPURunMode = STOP;
 				/* NOTE:: buggy in that we cannot do STOP and MCL without a running cpu between.. FIXME */
-				while ((s = sem_wait(&sem_stop)) == -1 && errno == EINTR) /* wait for stop lock to be free and take it */
+				while ((s = nd_sem_wait(&sem_stop)) == -1 && errno == EINTR) /* wait for stop lock to be free and take it */
 					continue; /* Restart if interrupted by handler */
 				bzero(gReg,sizeof(struct CpuRegs));	/* clear cpu */
-				setbit(_STS,_O,1);
+				nd_setbit(_STS,_O,1);
 				setbit_STS_MSB(_N100,1);
 				gCSR = 1<<2;    /* this bit sets the cache as not available */
 
@@ -1032,7 +1448,7 @@ void panel_thread() {
 				if (debug) fprintf(debugfile,"(#)LOAD_PRESSED\n");
 				gPC=STARTADDR;
 				CurrentCPURunMode = RUN;
-				if (sem_post(&sem_run) == -1) { /* release run lock */
+				if (nd_sem_post(&sem_run) == -1) { /* release run lock */
 					if (debug) fprintf(debugfile,"ERROR!!! sem_post failure panel_thread\n");
 					CurrentCPURunMode = SHUTDOWN;
 				}
@@ -1040,7 +1456,7 @@ void panel_thread() {
 				if (debug) fprintf(debugfile,"(#)STOP_PRESSED\n");
 				CurrentCPURunMode = STOP;
 				/* NOTE:: buggy in that we cannot do STOP and MCL without a running cpu between.. FIXME */
-				while ((s = sem_wait(&sem_stop)) == -1 && errno == EINTR) /* wait for stop lock to be free and take it */
+				while ((s = nd_sem_wait(&sem_stop)) == -1 && errno == EINTR) /* wait for stop lock to be free and take it */
 					continue; /* Restart if interrupted by handler */
 			} else {
 				if (debug) fprintf(debugfile,"(#)Panel received:%s\n",recv_data);
@@ -1052,13 +1468,13 @@ void panel_thread() {
 	return;
 }
 
-void setup_pap(){
+void setup_pap(void){
 	gPANS=0x8000;	/* Tell system we are here */
 	gPANS=gPANS | 0x4000;	/* Set FULL which is active low, so not full */
 	gPAP = calloc(1,sizeof(struct display_panel));
 }
 
-void panel_event(){
+void panel_event(void){
 	char tmpbyte;
 
 	if (gPAP->trr_panc) {	/* TRR has been issued, process command */
@@ -1135,10 +1551,10 @@ void panel_event(){
 
 }
 
-void panel_processor_thread() {
+void panel_processor_thread(void) {
 	int s;
 	while(CurrentCPURunMode != SHUTDOWN) {
-		while ((s = sem_wait(&sem_pap)) == -1 && errno == EINTR) /* wait for pap 'kick' */
+		while ((s = nd_sem_wait(&sem_pap)) == -1 && errno == EINTR) /* wait for pap 'kick' */
 			continue; /* Restart if interrupted by handler */
 
 		panel_event();

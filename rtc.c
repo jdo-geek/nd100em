@@ -2,6 +2,7 @@
  * nd100em - ND100 Virtual Machine
  *
  * Copyright (c) 2006-20011 Roger Abrahamsson
+ * Copyright (c) 2024 Heiko Bobzin
  *
  * This file is originated from the nd100em project.
  *
@@ -27,7 +28,6 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
-#include <semaphore.h>
 #include <sys/time.h>
 #include <sys/resource.h>
 #include "nd100.h"
@@ -38,7 +38,7 @@
  * This function runs as a continuous program basically.
  * Uses posix timers and signals.
  */
-void rtc_20(){
+void rtc_20(void){
 	int s;
 	int rc;
 	struct itimerval times;
@@ -66,7 +66,7 @@ void rtc_20(){
 	}
 
 	while(CurrentCPURunMode != SHUTDOWN) {
-		while ((s = sem_wait(&sem_rtc)) == -1 && errno == EINTR) /* wait for rtc synch lock to be free */
+		while ((s = nd_sem_wait(&sem_rtc)) == -1 && errno == EINTR) /* wait for rtc synch lock to be free */
 			continue;       /* Restart if interrupted by handler */
 		irq_en = sys_rtc->irq_en;
 		sys_rtc->rdy = 1;
@@ -78,7 +78,7 @@ void rtc_20(){
 			sys_rtc->cntr_20ms++;
 		cntr_20ms = sys_rtc->cntr_20ms;
 
-		if (sem_post(&sem_rtc) == -1) { /* release interrupt lock */
+		if (nd_sem_post(&sem_rtc) == -1) { /* release interrupt lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure rtc_20\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
@@ -88,7 +88,7 @@ void rtc_20(){
 /*TODO: tick panel second counter, also check if this is the right way, since we can "reset" the rtc 20ms timer */
 			if (cntr_20ms == 0){
 				gPAP->sec_tick = true;
-				if (sem_post(&sem_pap) == -1) { /* 'kick' panel processor thread */
+				if (nd_sem_post(&sem_pap) == -1) { /* 'kick' panel processor thread */
 					if (debug) fprintf(debugfile,"ERROR!!! sem_post failure rtc_20\n");
 					CurrentCPURunMode = SHUTDOWN;
 				}
@@ -97,19 +97,21 @@ void rtc_20(){
 
 		if (irq_en) {
 			if(CurrentCPURunMode != STOP) {
-				while ((s = sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
-					continue;       /* Restart if interrupted by handler */
-				gPID |= 0x2000; /* Bit 13 */
-				AddIdentChain(13,1,our_rnd_id); /* Add interrupt to ident chain, lvl13, ident code 1, and identify us */
-				if (sem_post(&sem_int) == -1) { /* release interrupt lock */
-					if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DOMCL\n");
-					CurrentCPURunMode = SHUTDOWN;
-				}
-				checkPK();
+                while ((s = nd_sem_wait(&sem_int)) == -1 && errno == EINTR) /* wait for interrupt lock to be free */
+                    continue;       /* Restart if interrupted by handler */
+ //               if (STS_PONI) {     // Only if we are in PT Mode
+                        gPID |= 0x2000; /* Bit 13 */
+                        AddIdentChain(13,1,our_rnd_id); /* Add interrupt to ident chain, lvl13, ident code 1, and identify us */
+                    checkPK_inInt("RTC");
+ //               }
+                if (nd_sem_post(&sem_int) == -1) { /* release interrupt lock */
+                    if (debug) fprintf(debugfile,"ERROR!!! sem_post failure DOMCL\n");
+                    CurrentCPURunMode = SHUTDOWN;
+                }
 			}
 //			if(!PANEL_PROCESSOR) /* No panel processor available, trigger mopc here */
 				if (MODE_OPCOM) {
-					if (sem_post(&sem_mopc) == -1) { /* release mopc lock */
+					if (nd_sem_post(&sem_mopc) == -1) { /* release mopc lock */
 						if (debug) fprintf(debugfile,"ERROR!!! sem_post failure rtc_20\n");
 						CurrentCPURunMode = SHUTDOWN;
 					}
@@ -117,7 +119,7 @@ void rtc_20(){
 
 		}
 		/* now wait for the alarms */
-		while ((s = sem_wait(&sem_rtc_tick)) == -1 && errno == EINTR) /* wait for rtc tick lock to be free */
+		while ((s = nd_sem_wait(&sem_rtc_tick)) == -1 && errno == EINTR) /* wait for rtc tick lock to be free */
 			continue;       /* Restart if interrupted by handler */
 	}
 }
@@ -155,13 +157,13 @@ void RTC_IO(ushort ioadd) {
 		/* Bit 3 = 1 => The clock is ready for transfer, i.e. a clock pulse has occured */
 		/* All other bits are zero */
 		gA = 0;
-		while ((s = sem_wait(&sem_rtc)) == -1 && errno == EINTR) /* wait for rtc synch lock to be free */
+		while ((s = nd_sem_wait(&sem_rtc)) == -1 && errno == EINTR) /* wait for rtc synch lock to be free */
 			continue;       /* Restart if interrupted by handler */
 		if (sys_rtc) { /* make sure clock structure exist */
 			gA |= (sys_rtc->irq_en) ? 1 : 0;
 			gA |= (sys_rtc->rdy) ?  1<<3 : 0;
 		}
-		if (sem_post(&sem_rtc) == -1) { /* release interrupt lock */
+		if (nd_sem_post(&sem_rtc) == -1) { /* release interrupt lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure RTC_IO\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}
@@ -169,13 +171,13 @@ void RTC_IO(ushort ioadd) {
 	case 013: /* Set real-time clock status.*/
 		/* Bit 0 = 1 => Enable interrupt if ready for transfer occurs */
 		/* Bit 13 = 1 => Clear Ready for transfer */
-		while ((s = sem_wait(&sem_rtc)) == -1 && errno == EINTR) /* wait for rtc synch lock to be free */
+		while ((s = nd_sem_wait(&sem_rtc)) == -1 && errno == EINTR) /* wait for rtc synch lock to be free */
 			continue;       /* Restart if interrupted by handler */
 		if (sys_rtc) { /* make sure clock structure exist */
 			sys_rtc->irq_en = (gA & 0x01) ? 1 : 0 ;
 			if ((gA >> 13 )& 0x01) sys_rtc->rdy = 0;
 		}
-		if (sem_post(&sem_rtc) == -1) { /* release interrupt lock */
+		if (nd_sem_post(&sem_rtc) == -1) { /* release interrupt lock */
 			if (debug) fprintf(debugfile,"ERROR!!! sem_post failure RTC_IO\n");
 			CurrentCPURunMode = SHUTDOWN;
 		}

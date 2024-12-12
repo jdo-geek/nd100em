@@ -3,6 +3,7 @@
  *
  * Copyright (c) 2006 Per-Olof Astrom
  * Copyright (c) 2006-2008 Roger Abrahamsson
+ * Copyright (c) 2024 Heiko Bobzin
  *
  * This file is originated from the nd100em project.
  *
@@ -20,7 +21,8 @@
  * along with this program (in the main directory of the nd100em
  * distribution in the file COPYING); if not, see <http://www.gnu.org/licenses/>.
  */
-
+#ifndef DEF_ND100_H
+#define DEF_ND100_H
 /* A complete listing of registers in a program level regbank including the 8 scratch regs. */
 #define _STS 0
 #define _D 1
@@ -229,7 +231,7 @@ struct ThreadChain {
  * unused variable called slotnum, which can be used later if we want to mimic ND100 ordering behaviour closer.
  */
 struct IdentChain {
-	char level; /* interrupt level this is. Might not be needed, if we use one list per level */
+	int level; /* interrupt level this is. Might not be needed, if we use one list per level */
 	ushort slotnum; /* which slot in the rack the device sits at. unused for now. */
 	ushort identcode; /* which interrupting device it is. */
 	int callerid;	/* We create this as a unique id, as there are identids that are same for several devices? */
@@ -240,13 +242,13 @@ typedef enum {SHUTDOWN, STOP, SEMIRUN, RUN} _RUNMODE_;
 
 typedef enum {ND1, ND4, ND10, ND100, ND100CE, ND100CX, ND110, ND110CE, ND110CX, ND110PCX} _CPUTYPE_;
 
-#define gPC	gReg->reg[((gReg->reg[0][_STS] & 0x0f00) >>8)][_P]
-#define gA	gReg->reg[((gReg->reg[0][_STS] & 0x0f00) >>8)][_A]
-#define gT	gReg->reg[((gReg->reg[0][_STS] & 0x0f00) >>8)][_T]
-#define gB	gReg->reg[((gReg->reg[0][_STS] & 0x0f00) >>8)][_B]
-#define gD	gReg->reg[((gReg->reg[0][_STS] & 0x0f00) >>8)][_D]
-#define gX	gReg->reg[((gReg->reg[0][_STS] & 0x0f00) >>8)][_X]
-#define gL	gReg->reg[((gReg->reg[0][_STS] & 0x0f00) >>8)][_L]
+#define gPC	gReg->reg[gPIL][_P]
+#define gA	gReg->reg[gPIL][_A]
+#define gT	gReg->reg[gPIL][_T]
+#define gB	gReg->reg[gPIL][_B]
+#define gD	gReg->reg[gPIL][_D]
+#define gX	gReg->reg[gPIL][_X]
+#define gL	gReg->reg[gPIL][_L]
 
 #define gPANC	gReg->reg_PANC
 #define gPANS	gReg->reg_PANS
@@ -270,10 +272,28 @@ typedef enum {ND1, ND4, ND10, ND100, ND100CE, ND100CX, ND110, ND110CE, ND110CX, 
 #define gPEA	gReg->reg_PEA
 #define gECCR	gReg->reg_ECCR
 
+/* Run levels:
+ 15 0x8000 highest: high user interrupts
+ 14 0x4000 internal interrupts
+ 13 0x2000 Real-Time clock
+ 12 0x1000 Input devices
+ 11 0x0800 Mass storage devices
+ 10 0x0400 Output devices
+ 9  0x0200 Direct tasks
+ 8  0x0100 Direct tasks
+ 7  0x0080 Direct tasks
+ 6  0x0040 Direct tasks
+ 5  0x0020 Direct tasks
+ 4  0x0010 I/O Monitor calls
+ 3  0x0008 SINTRAN III Monitor calls
+ 2  0x0004 Direct tasks
+ 1  0x0002 Realtime and background
+ 0  0x0001 IDLE
+ */
 /* Use lvl0 as default to start with, and then just always(!!!) set all levels when setting STS MSB flags */
 /* so by default we use reg[0][_STS] as MSB STS */
-#define CurrLEVEL	((gReg->reg[0][_STS] & 0x0f00) >>8)
 #define gPIL		((gReg->reg[0][_STS] & 0x0f00) >>8)
+#define CurrLEVEL    gPIL
 
 /* Highest runlevel with PIE AND PID bits both set */
 #define gPK		gReg->myreg_PK
@@ -284,18 +304,18 @@ typedef enum {ND1, ND4, ND10, ND100, ND100CE, ND100CX, ND110, ND110CE, ND110CX, 
 #define InstructionRegister	gReg->myreg_IR
 #define PrefetchBuffer		gReg->myreg_PFB
 
-#define STS_PTM  ((gReg->reg[((gReg->reg[0][_STS] & 0x0f00) >>8)][_STS] & 0x0001)>>0)	/* */
-#define STS_TG   ((gReg->reg[((gReg->reg[0][_STS] & 0x0f00) >>8)][_STS] & 0x0002)>>1)	/* */
-#define STS_K    ((gReg->reg[((gReg->reg[0][_STS] & 0x0f00) >>8)][_STS] & 0x0004)>>2)	/* */
-#define STS_Z    ((gReg->reg[((gReg->reg[0][_STS] & 0x0f00) >>8)][_STS] & 0x0008)>>3)	/* */
-#define STS_Q    ((gReg->reg[((gReg->reg[0][_STS] & 0x0f00) >>8)][_STS] & 0x0010)>>4)	/* */
-#define STS_O    ((gReg->reg[((gReg->reg[0][_STS] & 0x0f00) >>8)][_STS] & 0x0020)>>5)	/* */
-#define STS_C    ((gReg->reg[((gReg->reg[0][_STS] & 0x0f00) >>8)][_STS] & 0x0040)>>6)	/* */
-#define STS_M    ((gReg->reg[((gReg->reg[0][_STS] & 0x0f00) >>8)][_STS] & 0x0080)>>7)	/* */
-#define STS_PL   ((gReg->reg[0][_STS] & 0x0f00) >>8)					/* Program runlevel */
+#define STS_PTM  ((gReg->reg[gPIL][_STS] & 0x0001)>>0)	/* */
+#define STS_TG   ((gReg->reg[gPIL][_STS] & 0x0002)>>1)	/* */
+#define STS_K    ((gReg->reg[gPIL][_STS] & 0x0004)>>2)	/* */
+#define STS_Z    ((gReg->reg[gPIL][_STS] & 0x0008)>>3)	/* */
+#define STS_Q    ((gReg->reg[gPIL][_STS] & 0x0010)>>4)	/* */
+#define STS_O    ((gReg->reg[gPIL][_STS] & 0x0020)>>5)	/* */
+#define STS_C    ((gReg->reg[gPIL][_STS] & 0x0040)>>6)	/* */
+#define STS_M    ((gReg->reg[gPIL][_STS] & 0x0080)>>7)	/* */
+#define STS_PL   gPIL					/* Program runlevel */
 #define STS_N100 ((gReg->reg[0][_STS] & 0x1000) >>12)					/* Nord 100 indicator */
 #define STS_SEXI ((gReg->reg[0][_STS] & 0x2000) >>13)					/* Extended MMS adressing on/off indicator (24 bit instead of 19 bit*/
-#define STS_PONI ((gReg->reg[0][_STS] & 0x4000) >>14)					/* Memory management on/off indicator */
+#define STS_PONI ((gReg->reg[gPIL][_STS] & 0x4000) >>14)					/* Memory management on/off indicator */
 #define STS_IONI ((gReg->reg[0][_STS] & 0x8000) >>15)					/* Interrupt system on/off indicator */
 
 #define UNDEF_INSTR ((ushort)0142500)
@@ -338,3 +358,11 @@ struct display_panel {
 	int function_mode;
 };
 
+typedef struct _nd_sem {
+    pthread_mutex_t mutex;
+} nd_sem_t;
+
+extern int nd_sem_init(nd_sem_t * sem, int p, int value);
+extern int nd_sem_wait(nd_sem_t *);
+extern int nd_sem_post(nd_sem_t *);
+#endif

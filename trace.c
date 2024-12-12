@@ -2,6 +2,7 @@
  * nd100em - ND100 Virtual Machine
  *
  * Copyright (c) 2006-2008 Roger Abrahamsson
+ * Copyright (c) 2024 Heiko Bobzin
  *
  * This file is originated from the nd100em project.
  *
@@ -25,6 +26,7 @@
 #include <stdarg.h>
 
 #include <termios.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -32,6 +34,7 @@
 #include <string.h>
 #include "nd100.h"
 #include "trace.h"
+
 
 /*
  * Routine for tracing steps in instructions, this one for before doing instruction
@@ -50,7 +53,7 @@ void trace_pre(int num,...){
 			tmps=va_arg(ap, char *);
 			tmpi=va_arg(ap, int);
 			(void)snprintf(ts_block[ts_counter],MAXTSSTR,
-				"#s (i,s,w) #v# (\"%d\",\"0\",\"%s=%06o\");\n",(int)instr_counter,tmps,tmpi);
+				"#s (i,s,w) #v# (\"%li\",\"0\",\"%s=%06o\");\n",instr_counter,tmps,tmpi);
 			ts_counter++;
 		}
 	}
@@ -111,35 +114,25 @@ void trace_post(int num,...){
 void trace_exr(ushort instr){
 	char disasm_str[256];
 	if (trace & 0x01) {
-		OpToStr(disasm_str,instr);
+		OpToStr(disasm_str,gPC,instr, NULL, NULL);
 		fprintf(tracefile,"#e (i,d) #v# (\"%d\",\"%s\");\n",
 			(int)instr_counter,disasm_str);
 	}
 }
 
-void trace_instr(ushort instr){
-	ushort opcode;
+void trace_instr(ushort instr) {
 	char disasm_str[256];
-	char disasm_str2[256];
 
 	extract_opcode(instr);
 
 	if(trace & 0x01) {
-		OpToStr(disasm_str,instr);
-		fprintf(tracefile,"#c (i,l,a,d,c) #v# (\"%d\",\"%d\",\"%06o\",\"%06o\",\"%s\");\n",
-			(int)instr_counter,CurrLEVEL,gPC,instr,disasm_str);
-
-		if (opcode == 0140600 ){ /* EXR */
-			OpToStr(disasm_str,instr);
-			fprintf(trace2file,"| %08d | %02d | %06o | %06o | %s |\n",
-				(int)instr_counter,CurrLEVEL,gPC,instr,disasm_str);
-		} else
-			fprintf(trace2file,"| %08d | %02d | %06o | %06o | %s |\n",
-				(int)instr_counter,CurrLEVEL,gPC,instr,disasm_str);
+		OpToStr(disasm_str,gPC,instr, NULL, NULL);
+		fprintf(tracefile,"%010li LV=%d PC=%06o INS=%06o %s\n",
+			instr_counter,CurrLEVEL,gPC,instr,disasm_str);
 	}
 }
 
-void trace_regs() {
+void trace_regs(void) {
 	int i,j;
 	j=CurrLEVEL;
 	if (trace & 0x02){
@@ -184,7 +177,7 @@ void trace_regs() {
 	}
 }
 
-void trace_flush(){
+void trace_flush(void){
 	if (trace & 0x20) {
 		while (ts_counter > 0) {
 			ts_counter--;
@@ -195,24 +188,44 @@ void trace_flush(){
 	}
 }
 
-int trace_open(){
+extern FILE *debugfile;
+
+int trace_open(void){
 	tracefile=fopen(tracename,tracetype);
-	fprintf(tracefile,"USE nd100em;\n");
 
-	trace2file=fopen(trace2name,trace2type);
-
+    if (debugfile != NULL) {
+        fclose(debugfile);
+    }
+    debugfile = tracefile;
 	return(1);
 }
 
+int trace_shift_files(void){
+    char tracefile1[256];
+    char tracefile2[256];
+    if (tracefile != NULL) {
+        fclose(tracefile);
+        for (int i = 20; i > 0; i--) {
+            snprintf(tracefile1,255,"tracefile.%02d.log",i);
+            snprintf(tracefile2,255,"tracefile.%02d.log",i+1);
+            rename(tracefile1,tracefile2);
+        }
+        rename(tracename,tracefile1);
+    }
+    tracefile=fopen(tracename,tracetype);
 
-int trace2_open(){
-	trace2file=fopen(trace2name,trace2type);
+    debugfile = tracefile;
+    return(1);
+}
+
+
+int trace2_open(void){
 	return(1);
 }
 
 void disasm_instr(ushort addr, ushort instr){
 	char disasm_str[32];
-	OpToStr(disasm_str,instr);
+	OpToStr(disasm_str,gPC,instr,NULL, NULL);
 	if ((*p_DIS)[addr] != NULL) {
 		(*p_DIS)[addr]->iscode = true;
 		snprintf((*p_DIS)[addr]->asm_str,32,"%s",disasm_str);
@@ -221,7 +234,7 @@ void disasm_instr(ushort addr, ushort instr){
 
 void disasm_exr(ushort addr, ushort instr){
 	char disasm_str[32];
-	OpToStr(disasm_str,instr);
+	OpToStr(disasm_str,gPC,instr, NULL, NULL);
 	if ((*p_DIS)[addr] != NULL) {
 		(*p_DIS)[addr]->isexr = true;
 		snprintf((*p_DIS)[addr]->exr,32,"%s",disasm_str);
@@ -235,7 +248,7 @@ void disasm_addword(ushort addr, ushort myword){
 	}
 }
 
-void disasm_init(){
+void disasm_init(void){
 	int i;
 	for(i=0;i<65536;i++){
 		(*p_DIS)[i]= NULL;
@@ -271,15 +284,50 @@ void disasm_userel(ushort addr, ushort where){
 	}
 }
 
-void disasm_dump(){
+extern _NDRAM_        VolatileMemory;
+
+void disasm_full(FILE *out) {
+    ushort *mem = &(VolatileMemory.n_Array[0]);
+    char dis_str[256];
+    char memAccess[65536];
+    memset(&memAccess[0],0,sizeof(memAccess));
+
+    for (int i = 0; i < 65536; i++) {
+        ushort instr = mem[i];
+        ushort absAddress = 0;
+        char accessType = '?';
+        OpToStr(dis_str, i, instr,&absAddress, &accessType);
+        if (accessType == 'U') memAccess[absAddress] |= 1;
+        if (accessType == 'J') memAccess[absAddress] |= 2;
+        if (accessType == 'S') memAccess[absAddress] |= 4;
+        if (accessType == 'L') memAccess[absAddress] |= 8;
+    }
+    for (int i = 0; i < 65536; i++) {
+        ushort instr = mem[i];
+        ushort absAddress = 0;
+        char accessType = '?';
+        OpToStr(dis_str, i, instr,&absAddress, &accessType);
+        if (memAccess[i] & 1) fprintf(out,"U");
+        else fprintf(out," ");
+        if (memAccess[i] & 2) fprintf(out,"J");
+        else fprintf(out," ");
+        if (memAccess[i] & 4) fprintf(out,"S");
+        else fprintf(out," ");
+        if (memAccess[i] & 8) fprintf(out,"L");
+        else fprintf(out," ");
+        fprintf(out," %08o - %08o - %s\n",i,instr,dis_str);
+    }
+}
+
+void disasm_dump(void){
 	int i;
-	int tmp;
+	size_t tmp;
 	char u,l;
 	ushort w;
 	char disasm_str[32];
 
 	disasm_file=fopen(disasm_fname,disasm_ftype);
-
+    disasm_full(disasm_file);
 	for(i=0;i<65536;i++){
 		if ((*p_DIS)[i] != NULL) {
 			w = (*p_DIS)[i]->theword;
@@ -313,7 +361,7 @@ void disasm_dump(){
 					fprintf(disasm_file,"\'%c\'",l);
 
 				fprintf(disasm_file,"          ");
-				OpToStr(disasm_str,(*p_DIS)[i]->theword);
+				OpToStr(disasm_str,gPC,(*p_DIS)[i]->theword, NULL, NULL);
 				fprintf(disasm_file,"%% %s",disasm_str);
 			}
 			fprintf(disasm_file,"\n");

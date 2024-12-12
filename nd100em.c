@@ -2,6 +2,7 @@
  * nd100em - ND100 Virtual Machine
  *
  * Copyright (c) 2006-2011 Roger Abrahamsson
+ * Copyright (c) 2024 Heiko Bobzin
  *
  * This file is originated from the nd100em project.
  *
@@ -27,7 +28,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
-#include <semaphore.h>
 #include <signal.h>
 #include <unistd.h>
 #include <sys/time.h>
@@ -38,11 +38,16 @@
 #include "nd100.h"
 #include "nd100em.h"
 
+float usertime,systemtime,totaltime;
+struct rusage *used;
+nd_sem_t sem_sigthr;
+
 int main(int argc, char *argv[]) {
 	int res;
 
-	srand ( time(NULL) ); /* Generate PRNG Seed */
+	srand ( (unsigned int)time(NULL) ); /* Generate PRNG Seed */
 
+	printf("Starting...\n");
 	used=calloc(1,sizeof(struct rusage)); /* Perf counter stuff */
 	res=nd100emconf(); /* Load Configuration */
 	if (res) exit(1); /* Configuration error */
@@ -50,33 +55,41 @@ int main(int argc, char *argv[]) {
 		daemonize();
 	blocksignals();
 
+	printf("debug_open...\n");
 	if (debug) debug_open();
+	printf("trace_open...\n");
 	if (trace) trace_open();
 	if (DISASM) disasm_init();
 
-	if (sem_init(&sem_int, 0, 1) == -1)
+    if (nd_sem_init(&sem_int, 0, 1) == -1) {
+        perror("sem_init failed");
+        exit(1);
+    }
+	if (nd_sem_init(&sem_cons, 0, 0) == -1) /* console locked, so thread waits for output at start */
 		exit(1);
-	if (sem_init(&sem_cons, 0, 0) == -1) /* console locked, so thread waits for output at start */
+	if (nd_sem_init(&sem_sigthr, 0, 0) == -1) /* signal thread locked, so it doesn't finish prematurely */
 		exit(1);
-	if (sem_init(&sem_sigthr, 0, 0) == -1) /* signal thread locked, so it doesn't finish prematurely */
+	if (nd_sem_init(&sem_rtc_tick, 0, 1) == -1) /* start with no lock. */
 		exit(1);
-	if (sem_init(&sem_rtc_tick, 0, 1) == -1) /* start with no lock. */
+	if (nd_sem_init(&sem_rtc, 0, 1) == -1) /* start with no lock. */
 		exit(1);
-	if (sem_init(&sem_rtc, 0, 1) == -1) /* start with no lock. */
+	if (nd_sem_init(&sem_io, 0, 1) == -1) /* start with no lock. */
 		exit(1);
-	if (sem_init(&sem_io, 0, 1) == -1) /* start with no lock. */
+	if (nd_sem_init(&sem_floppy, 0, 1) == -1) /* start with lock. */
 		exit(1);
-	if (sem_init(&sem_floppy, 0, 1) == -1) /* start with lock. */
+    if (nd_sem_init(&sem_hdd, 0, 1) == -1) /* start with lock. */
+        exit(1);
+	if (nd_sem_init(&sem_mopc, 0, 1) == -1) /* start with lock. */
 		exit(1);
-	if (sem_init(&sem_mopc, 0, 1) == -1) /* start with lock. */
-		exit(1);
-	if (sem_init(&sem_run, 0, 0) == -1) /* start with no lock. */
+	if (nd_sem_init(&sem_run, 0, 0) == -1) /* start with no lock. */
 		exit(1);
 	if (PANEL_PROCESSOR)
-		if (sem_init(&sem_pap, 0, 1) == -1) /* start with no lock. */
+		if (nd_sem_init(&sem_pap, 0, 1) == -1) /* start with no lock. */
 			exit(1);
 
+	printf("setup_cpu...\n");
 	setup_cpu();
+	printf("program_load...\n");
 	program_load();
 
 	if (PANEL_PROCESSOR)
@@ -89,7 +102,7 @@ int main(int argc, char *argv[]) {
 	/* start the real machine as multiple threads */
 	start_threads();
 	pthread_join(gThreadChain->thread,NULL); /* TODO:: Maybe do this otherwise, we exploit that we "know" cputhread is first and will be running here */
-	stop_threads();
+	// stop_threads();
 
 	getrusage(RUSAGE_SELF, used);	/* Read how much resources we used */
 
@@ -98,11 +111,12 @@ int main(int argc, char *argv[]) {
 	totaltime=(float)usertime + (float)systemtime;
 
 	unsetcbreak ();
-	printf("Number of instructions run: %f, time used: %f\n",instr_counter,totaltime);
+	printf("Number of instructions run: %li, time used: %f\n",instr_counter,totaltime);
 	printf("usertime: %f  systemtime: %f\n",usertime,systemtime);
 	printf("Current cpu cycle time is:%f microsecs\n",(totaltime/((float)instr_counter/1000000)));
 
 	disasm_dump();
 
+    
 	return(0);
 }

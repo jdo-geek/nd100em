@@ -2,6 +2,7 @@
  * nd100em - ND100 Virtual Machine
  *
  * Copyright (c) 2006-2011 Roger Abrahamsson
+ * Copyright (c) 2024 Heiko Bobzin
  *
  * This file is originated from the nd100em project.
  *
@@ -28,7 +29,6 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
-#include <semaphore.h>
 #include <unistd.h>
 #include <sys/time.h>
 #include <sys/resource.h>
@@ -39,13 +39,35 @@
 #include "nd100.h"
 #include "nd100lib.h"
 
+char debugname[]="debug.log";
+char debugtype[]="a";
+FILE *debugfile;
+int debug = 1;
+
+struct ThreadChain *gThreadChain;
+
+int emulatemon = 1;
+
+int CONFIG_OK = 0;    /* This should be set to 1 when config file has been loaded OK */
+_BOOT_TYPE_    BootType; /* Variable holding the way we should boot up the emulator */
+ushort    STARTADDR;
+/* should we try and disassemble as we run? */
+int DISASM = 1;
+/* Should we detatch and become a daemon or not? */
+int DAEMON = 0;
+/* is console on a socket, or just the local one? */
+int CONSOLE_IS_SOCKET=0;
+
+struct config_t *pCFG;
+
 /*
  * IN: pointer to string of octal chars.
  * OUT: integer
  * NOTE: No error handling...Should not matter since it should only be called with 16 bit numbers normally
  */
 int octalstr_to_integer(char *str){
-	int i,len,res;
+    unsigned long i,len;
+    int res;
 	char ch;
 	len=strlen(str);
 	res=0;
@@ -79,7 +101,7 @@ int mysleep(int sec, int usec) {
  * fix checks for overflows.
  */
 
-int bpun_load() {
+int bpun_load(void) {
 	FILE *bpun_file;
 	char bpun[]="test.bpun";
 	char *str;
@@ -87,7 +109,8 @@ int bpun_load() {
 	char read_byte;
 	bool isnum,isheader;
 	ushort counter,bpun_words;
-	int count, b_num, c_num;
+    unsigned long count;
+    int b_num, c_num;
 	char loadtype[]="r";
 	ushort *addr;
 	addr = (ushort *)&VolatileMemory;
@@ -181,7 +204,7 @@ int bpun_load() {
 	return 0;
 }
 
-int bp_load() {
+int bp_load(void) {
 	int i; ushort eff_word;
 	FILE *bin_file;
 	char bpun[]="test.bp";
@@ -200,7 +223,7 @@ int bp_load() {
 	return 0;
 }
 
-int debug_open(){
+int debug_open(void){
 	debugfile=fopen(debugname,debugtype);
 	if(debugfile) {
 		fprintf(debugfile,"\n-----------------NEW DEBUG---------------------------------------\n");
@@ -211,12 +234,12 @@ int debug_open(){
 }
 
 void unsetcbreak (void) {/* prepare to exit this program. */
-	tcsetattr(0, TCSADRAIN, &savetty);
+	tcsetattr(0, TCSADRAIN, &nd_savetty);
 }
 
 void setcbreak (void) {/* set console input to raw mode. */
 	struct termios tty;
-	tcgetattr(0, &savetty);
+	tcgetattr(0, &nd_savetty);
 	tcgetattr(0, &tty);
 	tty.c_lflag &= ~(ECHO|ECHONL|ICANON|IEXTEN);
 	tty.c_cc[VTIME] = (cc_t)0;     /* inter-character timer unused */
@@ -224,7 +247,7 @@ void setcbreak (void) {/* set console input to raw mode. */
 	tcsetattr(0, TCSADRAIN, &tty);
 }
 
-struct ThreadChain *AddThreadChain() {
+struct ThreadChain *AddThreadChain(void) {
 	if (debug) fprintf(debugfile,"AddThreadChain called...\n");
 	if (debug) fflush(debugfile);
 
@@ -268,7 +291,7 @@ void RemThreadChain(struct ThreadChain * elem){
 /*
  * New config model used libconfig to load configuration file.
 */
-int nd100emconf(){
+int nd100emconf(void){
 	char conf[]="nd100em.conf";
 	char *tmpstr;
 	config_setting_t *setting = NULL;
@@ -407,22 +430,22 @@ int nd100emconf(){
 	return(0);
 }
 
-void shutdown(int signum){
+void nd_shutdown(int signum){
 	if (debug) fprintf(debugfile,"(####) shutdown routine running\n");
 	if (debug) fflush(debugfile);
 
 	/* This works for now. All threads should terminate if this variable is set */
 	CurrentCPURunMode = SHUTDOWN;
 
-	if (sem_post(&sem_run) == -1) { /* release rum lock */
+	if (nd_sem_post(&sem_run) == -1) { /* release rum lock */
 		if (debug) fprintf(debugfile,"ERROR!!! sem_post failure shutdown\n");
 	}
 
-	if (sem_post(&sem_mopc) == -1) { /* release mopc lock */
+	if (nd_sem_post(&sem_mopc) == -1) { /* release mopc lock */
 		if (debug) fprintf(debugfile,"ERROR!!! sem_post failure shutdown\n");
 	}
 
-	if (sem_post(&sem_sigthr) == -1) { /* release signal thread lock */
+	if (nd_sem_post(&sem_sigthr) == -1) { /* release signal thread lock */
 		if (debug) fprintf(debugfile,"ERROR!!! sem_post failure shutdown\n");
 	}
 
@@ -431,12 +454,17 @@ void shutdown(int signum){
 }
 
 void rtc_handler (int signum){
-	if (sem_post(&sem_rtc_tick) == -1) { /* release rtc tick  lock */
+	if (nd_sem_post(&sem_rtc_tick) == -1) { /* release rtc tick  lock */
 		if (debug) fprintf(debugfile,"ERROR!!! sem_post failure rtc_handler\n");
 	}
 }
 
-void blocksignals() {
+void savestate_handler(int signum) {
+    fprintf(stderr,"\nsavestate_handler\n"); fflush(stderr);
+    cpu_savestate();
+}
+
+void blocksignals(void) {
 	static sigset_t   new_set;
 	static sigset_t   old_set;
 	sigemptyset (&new_set);
@@ -456,14 +484,43 @@ void blocksignals() {
 	pthread_sigmask (SIG_BLOCK, &new_set, &old_set);
 }
 
-void setsignalhandlers() {
-	static sigset_t   new_set;
-	static sigset_t   old_set;
+void setupHandler(int signalNumber, void (*handler)(int))
+{
+    static struct sigaction act_alrm;
+    static sigset_t   new_set;
+    static sigset_t   old_set;
+    int res;
+    act_alrm.sa_handler = handler;
+    sigemptyset (&act_alrm.sa_mask);
+    res = sigaction (signalNumber, &act_alrm, NULL);
+    if (res != 0) {
+        perror("Sigaction failed.");
+        fprintf(stderr,"sigaction failed errno=%d\n",errno);
+    }
+    sigemptyset (&new_set);
+    sigemptyset (&old_set);
+    sigaddset (&new_set, signalNumber);
+    res = pthread_sigmask (SIG_UNBLOCK, &new_set, &old_set);
+    if (res != 0) {
+        fprintf(stderr,"pthread_sigmask failed\n");
+    }
+    sigemptyset (&new_set);
+    sigemptyset (&old_set);
+    sigaddset (&new_set, signalNumber);
+    res = sigprocmask (SIG_UNBLOCK, &new_set, &old_set);
+    if (res != 0) {
+        fprintf(stderr,"sigprocmask failed\n");
+    }
+    return;
+};
+
+void setsignalhandlers(void) {
+    static sigset_t   new_set;
+    static sigset_t   old_set;
 	static struct sigaction act;
-	static struct sigaction act_alrm;
 
 	/* set up handler for SIGINT, SIGHUP, SIGTERM */
-	act.sa_handler = &shutdown;
+	act.sa_handler = &nd_shutdown;
 	sigemptyset (&act.sa_mask);
 	sigaction (SIGINT, &act, NULL);
 	sigaction (SIGHUP, &act, NULL);
@@ -476,24 +533,20 @@ void setsignalhandlers() {
 	pthread_sigmask (SIG_UNBLOCK, &new_set, &old_set);
 
 	/* set up handler for SIGALARM */
-	act_alrm.sa_handler = &rtc_handler;
-	sigemptyset (&act_alrm.sa_mask);
-	sigaction (SIGALRM, &act_alrm, NULL);
-	sigemptyset (&new_set);
-	sigemptyset (&old_set);
-	sigaddset (&new_set, SIGALRM);
-	pthread_sigmask (SIG_UNBLOCK, &new_set, &old_set);
-	return;
+    setupHandler(SIGALRM, &rtc_handler);
+
+    /* set up handler for SIGUSR1 */
+    setupHandler(SIGUSR2, &savestate_handler);
 }
 
-void signal_thread(){
+void signal_thread(void){
 	int s;
 	setsignalhandlers();
-	while ((s = sem_wait(&sem_sigthr)) == -1 && errno == EINTR) /* wait for signal thread lock to be free */
+	while ((s = nd_sem_wait(&sem_sigthr)) == -1 && errno == EINTR) /* wait for signal thread lock to be free */
 		continue; /* Restart if interrupted by handler */
 }
 
-void daemonize() {
+void daemonize(void) {
 	pid_t pid, sid;
 	int i;
 
@@ -540,35 +593,41 @@ pthread_t add_thread(void *funcpointer, bool is_jointype){
 	pthread_create(&tc_elem->thread, &tc_elem->tattr, funcpointer, NULL );
 	return(tc_elem->thread);
 }
-
-void start_threads(){
+static int threadToInt(pthread_t id) {
+    return (int)(unsigned long)(id);
+}
+void start_threads(void){
 	pthread_t thread_id;
 	/* CPU Thread */
 	thread_id = add_thread(&cpu_thread,1);
-	if (debug) fprintf(debugfile,"Added thread id: %d as cpu_thread\n",(int)thread_id);
+	if (debug) fprintf(debugfile,"Added thread id: %d as cpu_thread\n",threadToInt(thread_id));
 	if (debug) fflush(debugfile);
 
 	thread_id = add_thread(&signal_thread,1);
-	if (debug) fprintf(debugfile,"Added thread id: %d as signal_thread\n",(int)thread_id);
+	if (debug) fprintf(debugfile,"Added thread id: %d as signal_thread\n",threadToInt(thread_id));
 	if (debug) fflush(debugfile);
 
 	thread_id = add_thread(&mopc_thread,1);
-	if (debug) fprintf(debugfile,"Added thread id: %d as mopc_thread\n",(int)thread_id);
+	if (debug) fprintf(debugfile,"Added thread id: %d as mopc_thread\n",threadToInt(thread_id));
 	if (debug) fflush(debugfile);
 
 	thread_id = add_thread(&rtc_20,0);
-	if (debug) fprintf(debugfile,"Added thread id: %d as rtc_20\n",(int)thread_id);
+	if (debug) fprintf(debugfile,"Added thread id: %d as rtc_20\n",threadToInt(thread_id));
 	if (debug) fflush(debugfile);
 
 	thread_id = add_thread(&panel_thread,0);
-	if (debug) fprintf(debugfile,"Added thread id: %d as panel_thread\n",(int)thread_id);
+	if (debug) fprintf(debugfile,"Added thread id: %d as panel_thread\n",threadToInt(thread_id));
 	if (debug) fflush(debugfile);
 
 	thread_id = add_thread(&floppy_thread,0);
-	if (debug) fprintf(debugfile,"Added thread id: %d as floppy_thread\n",(int)thread_id);
+	if (debug) fprintf(debugfile,"Added thread id: %d as floppy_thread\n",threadToInt(thread_id));
 	if (debug) fflush(debugfile);
 
-	if(CONSOLE_IS_SOCKET){
+    thread_id = add_thread(&hdd_thread,0);
+    if (debug) fprintf(debugfile,"Added thread id: %d as hdd\n",threadToInt(thread_id));
+    if (debug) fflush(debugfile);
+
+    if(CONSOLE_IS_SOCKET){
 		thread_id = add_thread(&console_socket_thread,0);
 	} else {
 		thread_id = add_thread(&console_stdio_thread,0);
@@ -576,20 +635,20 @@ void start_threads(){
 
 	if(PANEL_PROCESSOR){
 		thread_id = add_thread(&panel_processor_thread,0);
-		if (debug) fprintf(debugfile,"Added thread id: %d as panel_processor_thread\n",(int)thread_id);
+		if (debug) fprintf(debugfile,"Added thread id: %p as panel_processor_thread\n",thread_id);
 		if (debug) fflush(debugfile);
 	}
 
-	if (debug) fprintf(debugfile,"Added thread id: %d as console_socket/stdio_thread\n",(int)thread_id);
+	if (debug) fprintf(debugfile,"Added thread id: %p as console_socket/stdio_thread\n",thread_id);
 	if (debug) fflush(debugfile);
 }
 
-void stop_threads(){
-	if (debug) fprintf(debugfile,"REMOVE thread id: %d\n",(int)gThreadChain->thread);
+void stop_threads(void) {
+	if (debug) fprintf(debugfile,"REMOVE thread id: %p\n",gThreadChain->thread);
 	if (debug) fflush(debugfile);
 	RemThreadChain(gThreadChain);
 	while (gThreadChain) {
-		if (debug) fprintf(debugfile,"IN the kill while for threads with thread id: %d\n",(int)gThreadChain->thread);
+		if (debug) fprintf(debugfile,"IN the kill while for threads with thread id: %ld\n",(long)gThreadChain->thread);
 		if (debug) fflush(debugfile);
 
 		switch(gThreadChain->tk) {
@@ -608,7 +667,7 @@ void stop_threads(){
 	}
 }
 
-void setup_cpu(){
+void setup_cpu(void){
 	/* initialize an empty register set */
 	gReg=calloc(1,sizeof(struct CpuRegs));
 	/* initialize an empty pagetable */
@@ -618,7 +677,7 @@ void setup_cpu(){
 	/* initialize floppy drive data structures */
 	floppy_init();
 
-	setbit(_STS,_O,1);
+	nd_setbit(_STS,_O,1);
 	setbit_STS_MSB(_N100,1);
 	gCSR = 1<<2;	/* this bit sets the cache as not available */
 
@@ -631,7 +690,9 @@ void setup_cpu(){
 
 }
 
-void program_load(){
+extern void OpToStr(char *buf, ushort pc, ushort inst, ushort *absAddress, char *accType);
+
+void program_load(void){
 	switch(BootType){
 	case BP:
 		bp_load();
@@ -641,9 +702,84 @@ void program_load(){
 		bpun_load();
 		gPC = (CONFIG_OK) ? STARTADDR : 0;
 		break;
-	case FLOPPY:
-		sectorread(0,0,1,(ushort *)&VolatileMemory);
-		gPC = 0;
-		break;
+        case FLOPPY: {
+            char dis_str[256];
+            char memAccess[1024];
+            memset(&memAccess[0],0,sizeof(memAccess));
+            ushort *mem = (ushort *)&VolatileMemory;
+            sectorread(0,0,0,0,mem);
+/*
+            sectorread(0,0,1,&mem[256]);
+            sectorread(0,0,2,&mem[256*2]);
+            sectorread(0,0,3,&mem[256*3]);
+            for (int i = 0; i < 1024; i++) {
+                ushort instr = mem[i];
+                ushort absAddress = 0;
+                char accessType = '?';
+                OpToStr(dis_str, i, instr,&absAddress, &accessType);
+                if (absAddress < 1024) {
+                    if (accessType == 'U') memAccess[absAddress] |= 1;
+                    if (accessType == 'J') memAccess[absAddress] |= 2;
+                    if (accessType == 'S') memAccess[absAddress] |= 4;
+                    if (accessType == 'L') memAccess[absAddress] |= 8;
+                }
+            }
+            for (int i = 0; i < 1024; i++) {
+                ushort instr = mem[i];
+                ushort absAddress = 0;
+                char accessType = '?';
+                OpToStr(dis_str, i, instr,&absAddress, &accessType);
+                if (memAccess[i] & 1) printf("U");
+                else printf(" ");
+                if (memAccess[i] & 2) printf("J");
+                else printf(" ");
+                if (memAccess[i] & 4) printf("S");
+                else printf(" ");
+                if (memAccess[i] & 8) printf("L");
+                else printf(" ");
+                printf(" %8o - %8o - %s\n",i,instr,dis_str);
+            }
+*/
+            ushort p = 0;
+            while (p < 1024 && mem[p] != '!') p++;
+            if (mem[p] == '!') {
+                p++;
+                ushort start = mem[p++] << 8;
+                    start |= mem[p++];
+                ushort count = mem[p++] << 8;
+                count |= mem[p++];
+                ushort sum = 0;
+                for (int i = 0; i < count; i++) {
+                    ushort data = mem[p++] << 8;
+                    data |= mem[p++];
+                    mem[i] = data;
+                    sum += data;
+                    OpToStr(dis_str, i, data,NULL, NULL);
+                    printf(" %8o - %8o - %s\n",i,data,dis_str);
+                }
+                ushort check = mem[p++] << 8;
+                check |= mem[p++];
+                printf("sum=0x%04x, check=0x%04x\n",sum,check);
+            }
+            gPC = 0x2;
+            break;
+        }
 	}
+}
+
+int nd_sem_init(nd_sem_t * sem, int p, int value)
+{
+    pthread_mutex_init(&sem->mutex, NULL);
+    if (!value) {
+        pthread_mutex_lock(&sem->mutex);
+    }
+    return 0;
+}
+int nd_sem_wait(nd_sem_t *sem) {
+    pthread_mutex_lock(&sem->mutex);
+    return 0;
+}
+int nd_sem_post(nd_sem_t *sem) {
+    pthread_mutex_unlock(&sem->mutex);
+    return 0;
 }

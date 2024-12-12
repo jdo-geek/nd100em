@@ -33,7 +33,7 @@ extern unsigned short bank;
 extern unsigned short MON_RUN;
 extern struct CpuRegs *gReg;
 
-extern double instr_counter;
+extern long int instr_counter;
 
 
 extern int getch (void);
@@ -41,17 +41,17 @@ extern char mygetc (void);
 
 
 /* define existant mon call functions here */
-void mon_0();
-void mon_1();
-void mon_2();
-void mon_64();
-void mon_notyet();
+void mon_0(void);
+void mon_1(void);
+void mon_2(void);
+void mon_64(void);
+void mon_notyet(void);
 
 
 
 /* Array of pointers to mon call functions */
 
-void (*monarr[])() = {
+void (*monarr[])(void) = {
 	&mon_0,&mon_1,&mon_2,&mon_notyet,&mon_notyet,&mon_notyet,&mon_notyet,&mon_notyet,			/* MON 0-7     */
 	&mon_notyet,&mon_notyet,&mon_notyet,&mon_notyet,&mon_notyet,&mon_notyet,&mon_notyet,&mon_notyet,	/* MON 10-17   */
 	&mon_notyet,&mon_notyet,&mon_notyet,&mon_notyet,&mon_notyet,&mon_notyet,&mon_notyet,&mon_notyet,	/* MON 20-27   */

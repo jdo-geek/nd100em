@@ -2,6 +2,7 @@
  * nd100em - ND100 Virtual Machine
  *
  * Copyright (c) 2006-2008 Roger Abrahamsson
+ * Copyright (c) 2024 Heiko Bobzin
  *
  * This file is originated from the nd100em project.
  *
@@ -26,22 +27,23 @@ extern int DAEMON;
 extern int DISASM;
 extern ushort PANEL_PROCESSOR;
 
-extern double instr_counter;
+extern long int instr_counter;
 extern struct ThreadChain *gThreadChain;
 
-extern sem_t sem_int;
-extern sem_t sem_cons;
-extern sem_t sem_sigthr;
-extern sem_t sem_rtc_tick;
-extern sem_t sem_rtc;
-extern sem_t sem_io;
-extern sem_t sem_mopc;
-extern sem_t sem_run;
-extern sem_t sem_floppy;
-extern sem_t sem_pap;
+extern nd_sem_t sem_int;
+extern nd_sem_t sem_cons;
+extern nd_sem_t sem_sigthr;
+extern nd_sem_t sem_rtc_tick;
+extern nd_sem_t sem_rtc;
+extern nd_sem_t sem_io;
+extern nd_sem_t sem_mopc;
+extern nd_sem_t sem_run;
+extern nd_sem_t sem_floppy;
+extern nd_sem_t sem_hdd;
+extern nd_sem_t sem_pap;
 
-float usertime,systemtime,totaltime;
-struct rusage *used;
+extern float usertime,systemtime,totaltime;
+extern struct rusage *used;
 
 extern int octalstr_to_integer(char *str);
 extern int mysleep(int sec, int usec);
@@ -53,19 +55,19 @@ extern void setcbreak (void);
 extern struct ThreadChain *AddThreadChain(void);
 extern void RemThreadChain(struct ThreadChain * elem);
 extern int nd100emconf(void);
-extern void shutdown(void);
+extern void nd100_shutdown(void);
 extern void setsignals(void);
 extern void daemonize(void);
 extern void start_threads(void);
 extern void stop_threads(void);
 extern void setup_cpu(void);
 extern void program_load(void);
-extern void blocksignals();
-extern int trace_open();
+extern void blocksignals(void);
+extern int trace_open(void);
 extern void disasm_addword(ushort addr, ushort myword);
-extern void disasm_init();
-extern void disasm_dump();
-extern void setup_pap();
+extern void disasm_init(void);
+extern void disasm_dump(void);
+extern void setup_pap(void);
 
 
 int main(int argc, char *argv[]);

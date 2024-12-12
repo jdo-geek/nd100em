@@ -1,0 +1,4 @@
+*.o
+nd100em
+tracefile*.log
+debug.log

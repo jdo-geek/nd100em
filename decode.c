@@ -3,6 +3,7 @@
  *
  * Copyright (c) 2008 Roger Abrahamsson
  * Copyright (c) 2008 Zdravko
+ * Copyright (c) 2024 Heiko Bobzin
  *
  * This file is originated from the nd100em project.
  *

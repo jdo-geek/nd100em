@@ -35,12 +35,12 @@
 #include "nd100.h"
 #include "mon.h"
 
-void mon_0(){
+void mon_0(void){
 	MON_RUN=0;
 	gPC++;  // IF ERROR RETURN DONT COUNT UP
 }
 
-void mon_1(){
+void mon_1(void){
 	char slask;
 	slask = getchar();
 //	slask = mygetc();
@@ -81,7 +81,7 @@ void mon_1(){
 	gReg->reg[CurrLEVEL][_P]++;  // IF ERROR RETURN DONT COUNT UP
 }
 
-void mon_2(){ /* MON 2 OUTBT  T=Filenumber; A=Byte;  Ret A=errorcode */
+void mon_2(void){ /* MON 2 OUTBT  T=Filenumber; A=Byte;  Ret A=errorcode */
 	char ch=gA & 0x007F;
 	switch (ch) {
 		case 12: break;
@@ -101,16 +101,16 @@ void mon_2(){ /* MON 2 OUTBT  T=Filenumber; A=Byte;  Ret A=errorcode */
 	gReg->reg[CurrLEVEL][_P]++;  // IF ERROR RETURN DONT COUNT UP
 }
 
-void mon_3(){
+void mon_3(void){
 }
 
-void mon_4(){
+void mon_4(void){
 }
 
-void mon_5(){ /* MON 5 RDISK  T=blocknumber X=coreadress; Ret A=errorcode */
+void mon_5(void){ /* MON 5 RDISK  T=blocknumber X=coreadress; Ret A=errorcode */
 }
 
-void mon_47(){ /* SBRK - Special MONcall for MAC Assembler for setting breakpoints */
+void mon_47(void){ /* SBRK - Special MONcall for MAC Assembler for setting breakpoints */
 }
 
 /*
@@ -118,14 +118,14 @@ void mon_47(){ /* SBRK - Special MONcall for MAC Assembler for setting breakpoin
  * Returns current internal time.
  * AD = time in basic time units (normally 20 milliseconds).
  */
-void mon_11(){
+void mon_11(void){
 }
 
 /*
  * ERMSG
  * IN: A = Error number
  */
-void mon_64(){ /* ERMSG - Types an explanatory error message */
+void mon_64(void){ /* ERMSG - Types an explanatory error message */
 // Not really implemented yet
 //	fprintf("%s : %o\n","ERMSG",gA);
 	if  (trace & 0x01) fprintf(tracefile,
@@ -133,10 +133,10 @@ void mon_64(){ /* ERMSG - Types an explanatory error message */
 		(int)instr_counter,gA);
 }
 
-void mon_117(){
+void mon_117(void){
 }
 
-void mon_notyet() {
+void mon_notyet(void) {
 //	if (trace) fprintf(tracefile,"MONITOR CALL NOT IMPLEMENTED YET!!!\n");
 	if  (trace & 0x01) fprintf(tracefile,
 		"#o (i,d) #v# (\"%d\",\"MONITOR CALL NOT IMPLEMENTED YET!!!\");\n",

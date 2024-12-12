@@ -35,13 +35,13 @@ int NDFloat_Add (unsigned short int* p_a,unsigned short int* p_b,unsigned short 
 int NDFloat_Sub (unsigned short int* p_a,unsigned short int* p_b,unsigned short int* p_r);
 long double pow2l(int i);
 
-extern double instr_counter;
+extern long int instr_counter;
 extern int debug;
 extern FILE *debugfile;
 extern struct CpuRegs *gReg;
 void DoNLZ (char scaling);
 void DoDNZ (char scaling);
-extern void setbit(ushort regnum, ushort stsbit, char val);
+extern void nd_setbit(ushort regnum, ushort stsbit, char val);
 
 /* routine to sort out a missing powl in freebsd */
 long double pow2l(int i){
@@ -139,7 +139,7 @@ int old_NDFloat_Div(unsigned short int* p_a,unsigned short int* p_b,unsigned sho
 	a = ((unsigned long int)p_a[1])<<16 | p_a[2];	/* the host machine is Little Endian */
 	b = ((unsigned long int)p_b[1])<<16 | p_b[2];	/* the host machine is Little Endian */
 	/* Here we divide the two 32 bit long significants and get the 64 bit long rezult */
-	int msb = 0;
+	unsigned long msb = 0;
 	int bit = 63;
 	r[0] = 0;
 	r[1] = 0;
@@ -448,7 +448,7 @@ void old_DoDNZ(char scaling) {
 			reg_a = (ushort)(mantissa >> (32 - shift));
 		else {
 			/* Overflow */
-			setbit(_STS,_Z,1);
+			nd_setbit(_STS,_Z,1);
 			gT = 0;
 			gA = 0;
 			gD = 0;
@@ -695,7 +695,7 @@ int NDFloat_Sub(ushort* p_a, ushort* p_b,ushort* p_r) {
  *	NOTE: D will be cleared as per manual.
  */
 void DoNLZ (char scaling) {
-	if (debug) fprintf(debugfile,"DoNLZ: A:%06o scaling:%d instr_counter=%d\n",gA,(int)scaling,(int)instr_counter);
+	if (debug) fprintf(debugfile,"DoNLZ: A:%06o scaling:%d instr_counter=%li\n",gA,scaling,instr_counter);
 	if (gA==0) { /* special case, return with TAD=0 */
 		gT=0;
 		gA=0;
@@ -775,7 +775,7 @@ void DoDNZ(char scaling) {
 	if (debug) fprintf(debugfile,"DoDNZ: ******************************\n");
 	j= (int) i;
 	if (abs(j) > 32767)	/* Overflow */
-		setbit(_STS,_Z,1);
+		nd_setbit(_STS,_Z,1);
 	gT=0;
 	gD=0;
 }

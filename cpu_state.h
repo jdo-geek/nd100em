@@ -1,7 +1,7 @@
 /*
  * nd100em - ND100 Virtual Machine
  *
- * Copyright (c) 2006-2011 Roger Abrahamsson
+ * Copyright (c) 2006-2008 Roger Abrahamsson
  * Copyright (c) 2024 Heiko Bobzin
  *
  * This file is originated from the nd100em project.
@@ -21,31 +21,16 @@
  * distribution in the file COPYING); if not, see <http://www.gnu.org/licenses/>.
  */
 
-nd_sem_t sem_rtc_tick;
-nd_sem_t sem_rtc;
+#ifndef cpu_state_h
+#define cpu_state_h
+/**
+    Loads or saves the current CPU state.
+ */
+void cpustate(bool load,
+            ulong        *instr_counter,
+            _NDRAM_      *VolatileMemory,
+            struct CpuRegs *gReg,
+            union NewPT *gPT,
+            struct IdentChain **gIdentChain);
 
-struct rtc_data {
-        bool irq_en; /* enable irq when pulse occurs */
-        bool rdy; /* ready for transfer */
-	ushort cntr_20ms;	/* this should wrap at 50, so we count the num of 20ms interrupts to get second ticks */
-};
-
-struct rtc_data *sys_rtc = NULL;
-
-extern nd_sem_t sem_int;
-extern nd_sem_t sem_mopc;
-extern nd_sem_t sem_pap;
-extern struct display_panel *gPAP;
-
-extern struct CpuRegs *gReg;
-extern ushort MODE_OPCOM;
-extern ushort PANEL_PROCESSOR;
-extern _RUNMODE_      CurrentCPURunMode;
-extern int debug;
-extern FILE *debugfile;
-
-void rtc_20(void);
-void RTC_IO(ushort ioadd);
-
-extern void AddIdentChain(char lvl, ushort identnum, int callerid);
-extern void checkPK_inInt(char *msg);
+#endif /* cpu_state_h */
