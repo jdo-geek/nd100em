@@ -365,4 +365,5 @@ typedef struct _nd_sem {
 extern int nd_sem_init(nd_sem_t * sem, int p, int value);
 extern int nd_sem_wait(nd_sem_t *);
 extern int nd_sem_post(nd_sem_t *);
+extern char *script_console;    // in io.c
 #endif

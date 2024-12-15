@@ -73,6 +73,11 @@ extern union NewPT *gPT;
 extern struct MemTraceList *gMemTrace;
 extern struct IdentChain *gIdentChain;
 
+typedef struct {
+    ushort rtc_control;
+    ushort console_control;
+} iostate;
+
 #define ND_Memsize	(sizeof(VolatileMemory)/sizeof(ushort))
 
 /*

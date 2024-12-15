@@ -42,3 +42,26 @@ STOP_PRESSED
 Console communication format:
 Console communicates as a standard telnet connection...
 
+
+----
+December 2024: Booting from Floppy
+
+Current config is set to boot from floppy disk.
+See nd100em.conf how to setup SINTRAN III
+
+1) You need at least two raw Sintran III floppy images in the files
+floppy.nd100.00.img and floppy.nd100.01.img
+They can be created by "imd2raw < DISK1.IMD > floppy.nd100.00.img
+
+2) Set the script_console in nd100em.conf to boot both floppies.
+After some minutes the emulator should show:
+"%% THE SINTRAN III SYSTEM MAY NOW BE STARTED BY TYPING 22!"
+Press Ctrl-C to stop the emulator.
+
+3) Set the script_console to 
+script_console="LOAD MAC\r)HENT\r\r22!";
+and start the emulator again. The system will be loaded, some device errors
+will be shown. Press ESC and the ENTER will appear.
+
+4) Use floppy.nd100.03.img as the raw image to read from other system floppies.
+

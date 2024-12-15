@@ -3960,7 +3960,7 @@ void cpurun(void) {
 //	debug=0; /* PT DEBUGGING: remove once finished */
 	prefetch(); /* works because gPC should already be setup when cpurun is called */
 	gReg->myreg_IR = gReg->myreg_PFB;
-    if (load_state) {
+    if (cpustate_is_loadable()) {
         gA = 5;
         ndfunc_iox(0303);   // enable console IRQ
         gA = 1 | (1<<13);

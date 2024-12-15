@@ -27,6 +27,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 #include <sys/resource.h>
 #include <limits.h>
 #include <math.h>
@@ -36,6 +37,8 @@
 #include "cpu.h"
 
 #include "cpu_state.h"
+
+const char *CPUSTATE_FILE_NAME = "cpustate.bin";
 
 typedef struct _state {
     FILE *fp;
@@ -169,6 +172,9 @@ static void state_block(state *s, const char *key_prefix, unsigned char *value, 
     }
 }
 
+bool cpustate_is_loadable(void) {
+    return access(CPUSTATE_FILE_NAME, S_IRUSR) == 0;
+}
 
 void cpustate(bool load,
             ulong *instr_counter,
@@ -178,10 +184,9 @@ void cpustate(bool load,
             struct IdentChain **gIdentChain)
 {
     state s;
-    const char *path = "cpustate.bin";
-    s.fp = fopen(path,load ? "r" : "w");
+    s.fp = fopen(CPUSTATE_FILE_NAME,load ? "r" : "w");
     if (s.fp == NULL) {
-        fprintf(stderr,"cpustate: Failed to open %s, error %s\n",path,strerror(errno));
+        fprintf(stderr,"cpustate: Failed to open %s, error %s\n",CPUSTATE_FILE_NAME,strerror(errno));
         return;
     }
     s.load = load;

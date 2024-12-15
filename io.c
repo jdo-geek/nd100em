@@ -60,12 +60,7 @@ nd_sem_t sem_pap;
 
 struct display_panel *gPAP;
 
-//char script_console[] = "LOAD MAC\r10,0$\r\t110,0$";
-//char script_console[] = "LOAD MAC\r)HENT\r\r22!";
-char script_console[] = "LOAD MAC\r)REDEF\r4\rF\r)HENT\r\t322!";
-//char script_console[] = "LOAD MAC\r";
-
-char *script_console_in_ptr = &script_console[0];
+char *script_console = "";
 static int diskNumber = 0;
 
 /*
@@ -925,20 +920,15 @@ void console_stdio_in(void) {
 			/* this gets us max buffer size we can use */
 			numbytes = (cp < pp) ? 256-pp+cp-2 : (pp < cp) ? cp-pp-2 : 254;
 			numbytes = ( numbytes > 0) ? numbytes : 0;
-            if ((*script_console_in_ptr)) {
-                while ((*script_console_in_ptr)) {
-                    char ch = *script_console_in_ptr++;
+            if ((*script_console)) {
+                while ((*script_console)) {
+                    char ch = *script_console++;
                     if (ch == '\t') {
-                        char ch2 = *script_console_in_ptr++;
+                        char ch2 = *script_console++;
                         if (ch2 >= '0' && ch2 <= '9') {
                             select_floppy(ch2 - '0');
                         }
                     } else {
-                        if (ch == '!') {
-                            dump_mem("mem_01.dump");
-                            //trace_open();
-                            //trace = 15;
-                        }
                         *recv_data = ch;
                         numread = 1;
                         retval = 1;

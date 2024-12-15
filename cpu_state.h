@@ -23,10 +23,16 @@
 
 #ifndef cpu_state_h
 #define cpu_state_h
+
+/**
+ Checks if CPU state can be loaded.
+ */
+extern bool cpustate_is_loadable();
+
 /**
     Loads or saves the current CPU state.
  */
-void cpustate(bool load,
+extern void cpustate(bool load,
             ulong        *instr_counter,
             _NDRAM_      *VolatileMemory,
             struct CpuRegs *gReg,

@@ -405,6 +405,12 @@ int nd100emconf(void){
 	} else {
 		emulatemon = 0;
 	}
+    setting = config_lookup(pCFG, "script_console");
+    if (setting) {
+        tmpstr = (char *)config_setting_get_string(setting);
+        if (tmpstr)
+            script_console = strdup(tmpstr);
+    }
 	setting = config_lookup(pCFG, "floppy_image");
 	if (setting) {
 		tmpstr = (char *)config_setting_get_string(setting);

@@ -1,4 +1,8 @@
 *.o
 nd100em
-tracefile*.log
-debug.log
+*.log
+.vscode
+floppy*.img
+hdd*.img
+gdb.txt
+prepare.sh
